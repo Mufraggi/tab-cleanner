@@ -36,6 +36,7 @@ mod tests {
                     display_name: None,
                     theme: String::new(),
                     color: None,
+                    manual: false,
                 },
             ],
         };

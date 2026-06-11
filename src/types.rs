@@ -65,6 +65,11 @@ pub struct StoredGroup {
     /// User colour override. If None, the deterministic pick_color() is used.
     #[serde(default)]
     pub color: Option<String>,
+
+    /// Whether this group was created manually by the user (not via automatic grouping).
+    /// Manual groups remain visible in the popup even with zero open tabs.
+    #[serde(default)]
+    pub manual: bool,
 }
 
 /// Top-level persistence payload stored under GROUP_STATE_KEY.
@@ -72,6 +77,14 @@ pub struct StoredGroup {
 pub struct GroupState {
     pub version: u32,
     pub groups: Vec<StoredGroup>,
+}
+
+/// Query tabs by Chrome group id.
+/// Used by `handle_dissolve_group` to find tabs belonging to a group being dissolved.
+#[derive(Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct QueryByGroupId {
+    pub group_id: i32,
 }
 
 /// Storage key for the group state in chrome.storage.local.
@@ -132,6 +145,22 @@ mod tests {
         assert_eq!(group.group_id, Some(7));
         assert_eq!(group.display_name, None, "missing display_name must default to None");
         assert_eq!(group.theme, "", "missing theme must default to empty string");
+    }
+
+    #[test]
+    fn test_stored_group_deserialize_without_manual() {
+        // Old JSON without manual field — must deserialize to false
+        let json = r#"{
+            "name": "github.com",
+            "keywords": ["rust"],
+            "created_at_ms": 1000.0,
+            "updated_at_ms": 2000.0,
+            "group_id": 42,
+            "display_name": null,
+            "theme": ""
+        }"#;
+        let group: StoredGroup = serde_json::from_str(json).expect("deserialize old JSON without manual");
+        assert_eq!(group.manual, false, "missing manual must default to false");
     }
 
     #[test]

@@ -102,6 +102,7 @@ pub async fn apply_groups(
             display_name: None,
             theme: String::new(),
             color: None,
+            manual: false,
         };
         create_new_group_and_update(&mut new_group, &tab_ids).await;
         updated_groups.push(new_group);

@@ -42,6 +42,10 @@ fn Popup() -> impl IntoView {
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let data: RwSignal<Option<PopupData>> = RwSignal::new(None);
 
+    // New group creation state
+    let new_group_name: RwSignal<String> = RwSignal::new(String::new());
+    let show_new_group_input: RwSignal<bool> = RwSignal::new(false);
+
     // Initial load
     spawn_local(async move {
         match crate::popup::fetch_popup_data().await {
@@ -55,6 +59,27 @@ fn Popup() -> impl IntoView {
             }
         }
     });
+
+    // Shared refresh function (unused for now, but kept for future use)
+    let _refresh_data = {
+        let data = data;
+        let error_msg = error_msg;
+        move || {
+            let data = data.clone();
+            let error_msg = error_msg.clone();
+            spawn_local(async move {
+                match crate::popup::fetch_popup_data().await {
+                    Ok(pd) => {
+                        data.set(Some(pd));
+                        error_msg.set(None);
+                    }
+                    Err(e) => {
+                        error_msg.set(Some(e));
+                    }
+                }
+            });
+        }
+    };
 
     // Run grouping handler
     let on_run = move |_| {
@@ -105,7 +130,6 @@ fn Popup() -> impl IntoView {
 
     let commit_rename = {
         let data = data;
-        let error_msg = error_msg;
         let editing_name = editing_name;
         let draft_name = draft_name;
         move || {
@@ -115,7 +139,6 @@ fn Popup() -> impl IntoView {
                     let group_name = group_name.clone();
                     let new_name_clone = new_name.clone();
                     let data = data.clone();
-                    let error_msg = error_msg.clone();
 
                     // Optimistic UI update
                     data.update(|opt| {
@@ -126,36 +149,33 @@ fn Popup() -> impl IntoView {
                         }
                     });
 
-                    // Send to background
                     wasm_bindgen_futures::spawn_local(async move {
-                        match crate::popup::send_update_group(
-                            group_name,
-                            Some(new_name),
+                        // 1. Persist directly to storage (no background worker needed)
+                        let persist = crate::popup::persist_group_fields(
+                            &group_name,
+                            Some(&new_name),
                             None,
                             None,
-                        ).await {
-                            Ok(()) => {
-                                // Full refresh to pick up persisted value
-                                match crate::popup::fetch_popup_data().await {
-                                    Ok(pd) => {
-                                        data.set(Some(pd));
-                                        error_msg.set(None);
-                                    }
-                                    Err(e) => {
-                                        error_msg.set(Some(e));
-                                    }
-                                }
+                        ).await;
+
+                        // 2. Refresh UI from storage
+                        match crate::popup::fetch_popup_data().await {
+                            Ok(pd) => {
+                                data.set(Some(pd));
                             }
                             Err(e) => {
-                                error_msg.set(Some(format!("Echec renommage : {}", e)));
-                                // On failure, refresh to revert optimistic update
-                                match crate::popup::fetch_popup_data().await {
-                                    Ok(pd) => {
-                                        data.set(Some(pd));
-                                    }
-                                    Err(_) => {}
-                                }
+                                oxichrome::log!("[popup] Refresh apres renommage echoue: {}", e);
                             }
+                        }
+
+                        // 3. Best-effort: notify background to update Chrome native group
+                        if persist.is_ok() {
+                            crate::popup::send_update_group_best_effort(
+                                group_name,
+                                Some(new_name),
+                                None,
+                                None,
+                            ).await;
                         }
                     });
                 }
@@ -171,31 +191,93 @@ fn Popup() -> impl IntoView {
     // ── Colour change handler ──
     let on_color_change = {
         let data = data;
-        let error_msg = error_msg;
         move |group_name: String, color_name: String| {
+            let hex = crate::popup::lookup_hex(&color_name).to_string();
+            let gn = group_name.clone();
+            let cn = color_name.clone();
+
+            // 1. Update local display immediately (optimistic)
+            data.update(|opt| {
+                if let Some(ref mut pd) = opt {
+                    if let Some(g) = pd.groups.iter_mut().find(|g| g.name == gn) {
+                        g.color_name = cn;
+                        g.color_hex = hex;
+                    }
+                }
+            });
+
             let data = data.clone();
-            let error_msg = error_msg.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match crate::popup::send_update_group(
-                    group_name,
-                    None,           // display_name unchanged
-                    Some(color_name),
-                    None,           // theme unchanged
-                ).await {
-                    Ok(()) => {
-                        // Refresh popup data
-                        match crate::popup::fetch_popup_data().await {
-                            Ok(pd) => {
-                                data.set(Some(pd));
-                                error_msg.set(None);
-                            }
-                            Err(e) => {
-                                error_msg.set(Some(e));
-                            }
-                        }
+                // 2. Persist directly to storage (no background worker needed)
+                let persist = crate::popup::persist_group_fields(
+                    &group_name,
+                    None,
+                    Some(&color_name),
+                    None,
+                ).await;
+
+                // 3. Refresh UI from storage
+                match crate::popup::fetch_popup_data().await {
+                    Ok(pd) => {
+                        data.set(Some(pd));
                     }
                     Err(e) => {
-                        error_msg.set(Some(format!("Echec couleur : {}", e)));
+                        oxichrome::log!("[popup] Refresh apres couleur echoue: {}", e);
+                    }
+                }
+
+                // 4. Best-effort: notify background to update Chrome native group
+                if persist.is_ok() {
+                    crate::popup::send_update_group_best_effort(
+                        group_name,
+                        None,
+                        Some(color_name),
+                        None,
+                    ).await;
+                }
+            });
+        }
+    };
+
+    // ── New group creation handler ──
+    let on_create_group = {
+        let data = data.clone();
+        move || {
+            let name = new_group_name.get_untracked();
+            let trimmed = name.trim().to_string();
+            if trimmed.is_empty() {
+                return;
+            }
+            new_group_name.set(String::new());
+            show_new_group_input.set(false);
+            let data = data.clone();
+            spawn_local(async move {
+                let _ = crate::popup::persist_create_group(&trimmed).await;
+                match crate::popup::fetch_popup_data().await {
+                    Ok(pd) => {
+                        data.set(Some(pd));
+                    }
+                    Err(e) => {
+                        oxichrome::log!("[popup] Refresh apres creation echoue: {}", e);
+                    }
+                }
+            });
+        }
+    };
+
+    // ── Dissolve group handler ──
+    let on_dissolve_group = {
+        let data = data.clone();
+        move |name: String| {
+            let data = data.clone();
+            spawn_local(async move {
+                crate::popup::send_dissolve_group_best_effort(name).await;
+                match crate::popup::fetch_popup_data().await {
+                    Ok(pd) => {
+                        data.set(Some(pd));
+                    }
+                    Err(e) => {
+                        oxichrome::log!("[popup] Refresh apres dissolution echoue: {}", e);
                     }
                 }
             });
@@ -205,32 +287,27 @@ fn Popup() -> impl IntoView {
     // ── Theme change handler ──
     let on_theme_change = {
         let data = data;
-        let error_msg = error_msg;
         move |group_name: String, theme_value: String| {
             let data = data.clone();
-            let error_msg = error_msg.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                match crate::popup::send_update_group(
-                    group_name,
-                    None,           // display_name unchanged
-                    None,           // color unchanged
-                    Some(theme_value),
-                ).await {
-                    Ok(()) => {
-                        match crate::popup::fetch_popup_data().await {
-                            Ok(pd) => {
-                                data.set(Some(pd));
-                                error_msg.set(None);
-                            }
-                            Err(e) => {
-                                error_msg.set(Some(e));
-                            }
-                        }
+                // 1. Persist directly to storage ONLY (theme has no Chrome API effect)
+                let _ = crate::popup::persist_group_fields(
+                    &group_name,
+                    None,
+                    None,
+                    Some(&theme_value),
+                ).await;
+
+                // 2. Refresh UI from storage
+                match crate::popup::fetch_popup_data().await {
+                    Ok(pd) => {
+                        data.set(Some(pd));
                     }
                     Err(e) => {
-                        error_msg.set(Some(format!("Echec theme : {}", e)));
+                        oxichrome::log!("[popup] Refresh apres theme echoue: {}", e);
                     }
                 }
+                // NO background call — theme is storage-only
             });
         }
     };
@@ -289,6 +366,67 @@ fn Popup() -> impl IntoView {
                 <div class="tc-last-run">
                     {move || if is_ranking.get() { "Rangement en cours\u{2026}" } else { "Dernier rangement a l'ouverture" }}
                 </div>
+
+                // ── New group creation ──
+                <div class="tc-new-group-area">
+                    {move || if show_new_group_input.get() {
+                        let val = new_group_name.get();
+                        let on_input = move |ev: leptos::ev::Event| {
+                            if let Some(target) = ev.target() {
+                                if let Ok(v) = js_sys::Reflect::get(
+                                    &target,
+                                    &wasm_bindgen::JsValue::from_str("value"),
+                                ) {
+                                    if let Some(s) = v.as_string() {
+                                        new_group_name.set(s);
+                                    }
+                                }
+                            }
+                        };
+                        let on_key = move |ev: leptos::ev::KeyboardEvent| {
+                            if ev.key() == "Enter" {
+                                on_create_group();
+                            } else if ev.key() == "Escape" {
+                                show_new_group_input.set(false);
+                                new_group_name.set(String::new());
+                            }
+                        };
+                        let on_blur = move |_| {};
+                        let on_create_click = on_create_group.clone();
+                        view! {
+                            <div class="tc-new-group-row">
+                                <input
+                                    class="tc-new-group-input"
+                                    prop:value={val}
+                                    on:input=on_input
+                                    on:keydown=on_key
+                                    on:blur=on_blur
+                                    autofocus=true
+                                    placeholder="Nom du groupe..."
+                                />
+                                <button
+                                    class="tc-create-btn"
+                                    on:click=move |_| {
+                                        on_create_click();
+                                    }
+                                >
+                                    "Creer"
+                                </button>
+                            </div>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <button
+                                class="tc-new-group-btn"
+                                on:click=move |_| show_new_group_input.set(true)
+                            >
+                                "+ Nouveau groupe"
+                            </button>
+                        }
+                        .into_any()
+                    }}
+                </div>
             </header>
 
             // ── Content ──
@@ -321,6 +459,7 @@ fn Popup() -> impl IntoView {
                             cancel_rename.clone(),
                             on_color_change,
                             on_theme_change,
+                            on_dissolve_group,
                         ).into_any()
                     } else {
                         view! {}.into_any()

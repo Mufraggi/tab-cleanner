@@ -203,6 +203,7 @@ pub fn reconcile(
             display_name: None,
             theme: String::new(),
             color: None,
+            manual: false,
         });
     }
 
@@ -420,6 +421,7 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: Some("blue".into()),
+                manual: false,
             }],
         };
         let fresh = vec![GroupAssignment {
@@ -447,6 +449,7 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: None,
+                manual: false,
             }],
         };
         let fresh = vec![GroupAssignment {
@@ -475,6 +478,7 @@ mod tests {
                 display_name: Some("YouTube".into()),
                 theme: "blue".into(),
                 color: None,
+                manual: false,
             }],
         };
         let fresh = vec![GroupAssignment {
@@ -536,6 +540,7 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: None,
+                manual: false,
             }],
         };
         let fresh = vec![
@@ -576,6 +581,7 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: None,
+                manual: false,
             }],
         };
         let fresh = vec![
@@ -610,6 +616,7 @@ mod tests {
                     display_name: None,
                     theme: String::new(),
                     color: None,
+                    manual: false,
                 },
                 StoredGroup {
                     name: "old-domain.com".into(),
@@ -620,6 +627,7 @@ mod tests {
                     display_name: None,
                     theme: String::new(),
                     color: None,
+                    manual: false,
                 },
             ],
         };
@@ -670,12 +678,59 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: None,
+                manual: false,
             }],
         };
         let fresh: Vec<GroupAssignment> = vec![];
         let result = reconcile(&fresh, &stored, 2000.0);
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].name, "github.com");
+    }
+
+    #[test]
+    fn test_reconcile_preserves_manual() {
+        // Stored group with manual: true must keep it after reconcile.
+        let stored = GroupState {
+            version: 1,
+            groups: vec![StoredGroup {
+                name: "github.com".into(),
+                keywords: vec!["rust".into()],
+                created_at_ms: 1000.0,
+                updated_at_ms: 1000.0,
+                group_id: Some(42),
+                display_name: None,
+                theme: String::new(),
+                color: None,
+                manual: true,
+            }],
+        };
+        let fresh = vec![GroupAssignment {
+            tab_id: 1,
+            group_name: "github.com".into(),
+            domain: Some("github.com".into()),
+            keywords: vec!["rust".into()],
+        }];
+        let result = reconcile(&fresh, &stored, 2000.0);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].manual, true);
+    }
+
+    #[test]
+    fn test_reconcile_new_group_manual_false() {
+        // Freshly created group (not previously stored) must have manual: false.
+        let stored = GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let fresh = vec![GroupAssignment {
+            tab_id: 1,
+            group_name: "github.com".into(),
+            domain: Some("github.com".into()),
+            keywords: vec!["rust".into()],
+        }];
+        let result = reconcile(&fresh, &stored, 2000.0);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].manual, false);
     }
 
     // -----------------------------------------------------------------------
@@ -855,6 +910,7 @@ mod tests {
                 display_name: None,
                 theme: String::new(),
                 color: None,
+                manual: false,
             }],
         };
 

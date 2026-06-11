@@ -35,6 +35,9 @@ pub struct GroupDisplay {
     pub color_hex: String,
     pub theme: String,
     pub tabs: Vec<TabInfo>,
+    /// The Chrome tab group id, if the group has been materialised in the browser.
+    /// `None` for groups that haven't been created yet or have been dissolved.
+    pub group_id: Option<i32>,
 }
 
 #[derive(Clone)]
@@ -99,8 +102,8 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
     let mut groups: Vec<GroupDisplay> = Vec::with_capacity(state.groups.len());
     for stored in &state.groups {
         let tabs_in_group = group_tabs.remove(&stored.name).unwrap_or_default();
-        if tabs_in_group.is_empty() {
-            continue; // skip orphaned groups — they stay in storage but are hidden
+        if tabs_in_group.is_empty() && !stored.manual {
+            continue; // skip orphaned non-manual groups — they stay in storage but are hidden
         }
         let cname = stored
             .color
@@ -116,6 +119,7 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
             color_hex: lookup_hex(&cname).to_string(),
             theme: stored.theme.clone(),
             tabs: tabs_in_group,
+            group_id: stored.group_id,
         });
     }
 
@@ -174,6 +178,135 @@ pub async fn send_update_group(
     Ok(())
 }
 
+/// Persist group fields directly to storage (bypasses background worker).
+///
+/// Reads `GroupState` from storage, finds the `StoredGroup` by `name`,
+/// applies the specified field updates, and writes back.
+/// Returns an error if the group is not found or storage operations fail.
+pub async fn persist_group_fields(
+    name: &str,
+    display_name: Option<&str>,
+    color: Option<&str>,
+    theme: Option<&str>,
+) -> Result<(), String> {
+    let mut state: GroupState = storage::get::<GroupState>(GROUP_STATE_KEY)
+        .await
+        .map_err(|e| format!("Erreur de lecture du storage : {:?}", e))?
+        .unwrap_or_else(|| GroupState {
+            version: 1,
+            groups: vec![],
+        });
+
+    let group = state
+        .groups
+        .iter_mut()
+        .find(|g| g.name == name)
+        .ok_or_else(|| format!("Groupe '{}' introuvable", name))?;
+
+    if let Some(dn) = display_name {
+        group.display_name = Some(dn.to_string());
+    }
+    if let Some(c) = color {
+        group.color = Some(c.to_string());
+    }
+    if let Some(t) = theme {
+        group.theme = t.to_string();
+    }
+
+    storage::set(GROUP_STATE_KEY, &state)
+        .await
+        .map_err(|e| format!("Erreur d'écriture du storage : {:?}", e))?;
+
+    Ok(())
+}
+
+/// Best-effort variant of `send_update_group`.
+///
+/// Sends an `UpdateGroup` command to the background worker **only** to apply
+/// Chrome-native group changes (colour, title). If the worker is sleeping
+/// (MV3), the send fails silently — the data is already persisted in storage
+/// by the caller. Errors are logged via `oxichrome::log!` but never surfaced
+/// to the user.
+pub async fn send_update_group_best_effort(
+    name: String,
+    display_name: Option<String>,
+    color: Option<String>,
+    theme: Option<String>,
+) {
+    if let Err(e) = send_update_group(name, display_name, color, theme).await {
+        oxichrome::log!(
+            "[popup] UpdateGroup best-effort failed (worker sleeping?): {}",
+            e
+        );
+    }
+}
+
+/// Create a new manual group directly in storage.
+///
+/// Reads `GroupState` from storage, checks for duplicates (idempotent),
+/// appends a new `StoredGroup` with `manual: true`, and writes back.
+/// Returns an error if storage operations fail.
+pub async fn persist_create_group(name: &str) -> Result<(), String> {
+    let mut state: GroupState = storage::get::<GroupState>(GROUP_STATE_KEY)
+        .await
+        .map_err(|e| format!("Erreur de lecture du storage : {:?}", e))?
+        .unwrap_or_else(|| GroupState {
+            version: 1,
+            groups: vec![],
+        });
+
+    // Idempotent: skip if group already exists
+    if state.groups.iter().any(|g| g.name == name) {
+        return Ok(());
+    }
+
+    let now = js_sys::Date::now();
+    state.groups.push(crate::types::StoredGroup {
+        name: name.to_string(),
+        keywords: vec![],
+        created_at_ms: now,
+        updated_at_ms: now,
+        group_id: None,
+        display_name: Some(name.to_string()),
+        theme: String::new(),
+        color: None,
+        manual: true,
+    });
+
+    storage::set(GROUP_STATE_KEY, &state)
+        .await
+        .map_err(|e| format!("Erreur d'écriture du storage : {:?}", e))?;
+
+    Ok(())
+}
+
+/// Best-effort variant to send a `DissolveGroup` command to the background worker.
+///
+/// If the worker is sleeping (MV3), the send fails silently.
+/// Errors are logged via `oxichrome::log!` but never surfaced to the user.
+pub async fn send_dissolve_group_best_effort(name: String) {
+    let cmd = PopupCommand::DissolveGroup { name };
+    match runtime::send_message(&cmd).await {
+        Ok(resp_js) => {
+            let _resp: MessagingResponse = serde_wasm_bindgen::from_value(resp_js).unwrap_or_else(|e| {
+                oxichrome::log!(
+                    "[popup] DissolveGroup best-effort response parse error: {:?}",
+                    e
+                );
+                MessagingResponse {
+                    success: false,
+                    data: Some(format!("Parse error: {:?}", e)),
+                }
+            });
+        }
+        Err(e) => {
+            oxichrome::log!(
+                "[popup] DissolveGroup best-effort failed (worker sleeping?): {:?}",
+                e
+            );
+        }
+    }
+}
 
 // ── Render groups list ──
 
@@ -188,6 +321,7 @@ pub fn render_content(
     on_cancel_rename: impl Fn() + 'static + Clone + Send,
     on_color_change: impl Fn(String, String) + 'static + Clone + Send,
     on_theme_change: impl Fn(String, String) + 'static + Clone + Send,
+    on_dissolve_group: impl Fn(String) + 'static + Clone + Send,
 ) -> impl IntoView {
     // ── Reactive groups list for <For> ──
     let groups_each = move || {
@@ -245,6 +379,11 @@ pub fn render_content(
                 let ot = on_theme_change.clone();
                 let gn_color = name.clone();
                 let gn_theme = name.clone();
+
+                // Dissolve callback
+                let od = on_dissolve_group.clone();
+                let gn_dissolve = name.clone();
+                let has_group_id = g.group_id.is_some();
 
 
                 view! {
@@ -430,6 +569,21 @@ pub fn render_content(
                                             "Servira au tri automatique : explique en quelques mots ce que contient ce groupe."
                                         </p>
                                         <ul class="tc-tab-list">{tab_items}</ul>
+                                        {if has_group_id {
+                                            let od_btn = od.clone();
+                                            let gn_d_btn = gn_dissolve.clone();
+                                            view! {
+                                                <button
+                                                    class="tc-dissolve-btn"
+                                                    on:click=move |_| od_btn(gn_d_btn.clone())
+                                                >
+                                                    "Dissoudre"
+                                                </button>
+                                            }
+                                            .into_any()
+                                        } else {
+                                            view! {}.into_any()
+                                        }}
                                     </div>
                                 }
                                 .into_any()
@@ -825,4 +979,79 @@ pub const CSS: &str = r#"
 ::-webkit-scrollbar { width: 9px; }
 ::-webkit-scrollbar-thumb { background: #323845; border-radius: 6px; border: 2px solid #171a21; }
 ::-webkit-scrollbar-track { background: transparent; }
+
+/* ── New group creation ── */
+.tc-new-group-area {
+    margin-top: 8px;
+}
+.tc-new-group-btn {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 6px;
+    padding: 8px 12px;
+    border-radius: 8px;
+    border: 1px dashed #323845;
+    background: transparent;
+    color: #8a8f98;
+    font-size: 12px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, color .15s;
+}
+.tc-new-group-btn:hover {
+    background: #21252e;
+    color: #e7e9ee;
+    border-color: #4f6ef0;
+}
+.tc-new-group-row {
+    display: flex;
+    gap: 8px;
+}
+.tc-new-group-input {
+    flex: 1;
+    background: #171a21;
+    border: 1px solid #4f6ef0;
+    border-radius: 8px;
+    color: #e7e9ee;
+    padding: 8px 10px;
+    font-size: 12.5px;
+    outline: none;
+}
+.tc-new-group-input::placeholder { color: #5a606c; }
+.tc-create-btn {
+    padding: 8px 14px;
+    border-radius: 8px;
+    border: none;
+    background: linear-gradient(180deg, #6d8cff, #4f6ef0);
+    color: #fff;
+    font-weight: 600;
+    font-size: 12px;
+    cursor: pointer;
+    white-space: nowrap;
+}
+.tc-create-btn:hover { filter: brightness(1.06); }
+.tc-create-btn:active { transform: translateY(1px); }
+
+/* ── Dissolve button ── */
+.tc-dissolve-btn {
+    display: block;
+    width: 100%;
+    margin-top: 10px;
+    padding: 7px 12px;
+    border-radius: 8px;
+    border: 1px solid #3a3033;
+    background: transparent;
+    color: #c78a8a;
+    font-size: 11.5px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: background .15s, border-color .15s;
+}
+.tc-dissolve-btn:hover {
+    background: rgba(224,90,82,.08);
+    border-color: #e05a52;
+    color: #e05a52;
+}
 "#;

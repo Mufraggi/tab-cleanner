@@ -34,6 +34,14 @@ pub enum PopupCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         theme: Option<String>,
     },
+    /// Create a new empty manual group.
+    CreateGroup {
+        name: String,
+    },
+    /// Dissolve an existing group (ungroup its tabs, keep the group entry).
+    DissolveGroup {
+        name: String,
+    },
 }
 
 /// Response sent back to the popup after handling a command.
@@ -111,6 +119,89 @@ async fn handle_update_group(
     }
 
     // 5. Persist updated state
+    crate::storage::save_state(&state).await;
+
+    Ok(())
+}
+
+/// Pure logic: add a new manual group to the state.
+///
+/// Returns `true` if the group was added, `false` if it already existed (idempotent).
+pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, now_ms: f64) -> bool {
+    if state.groups.iter().any(|g| g.name == name) {
+        return false; // already exists — idempotent
+    }
+    state.groups.push(crate::types::StoredGroup {
+        name: name.to_string(),
+        keywords: vec![],
+        created_at_ms: now_ms,
+        updated_at_ms: now_ms,
+        group_id: None,
+        display_name: Some(name.to_string()),
+        theme: String::new(),
+        color: None,
+        manual: true,
+    });
+    true
+}
+
+/// Async handler: create a new manual group.
+async fn handle_create_group(name: String) -> Result<(), String> {
+    let mut state = crate::storage::load_state().await;
+    let _ = apply_create_group(&mut state, &name, js_sys::Date::now());
+    crate::storage::save_state(&state).await;
+    Ok(())
+}
+
+/// Pure logic: dissolve a group by clearing its `group_id`.
+///
+/// Returns `Ok(())` if the group was found (even if `group_id` was already `None`),
+/// or `Err(...)` if the group doesn't exist.
+pub fn apply_dissolve_group(state: &mut crate::types::GroupState, name: &str) -> Result<(), String> {
+    let group = state
+        .groups
+        .iter_mut()
+        .find(|g| g.name == name)
+        .ok_or_else(|| format!("Groupe '{}' introuvable", name))?;
+    group.group_id = None;
+    Ok(())
+}
+
+/// Async handler: dissolve a group (ungroup its Chrome tabs, clear its group_id).
+async fn handle_dissolve_group(name: String) -> Result<(), String> {
+    // 1. Load state and find group
+    let mut state = crate::storage::load_state().await;
+    let chrome_group_id: Option<i32>;
+
+    {
+        let group = state
+            .groups
+            .iter()
+            .find(|g| g.name == name)
+            .ok_or_else(|| format!("Groupe '{}' introuvable", name))?;
+        chrome_group_id = group.group_id;
+    }
+
+    // 2. If the group has a Chrome group id, ungroup its tabs
+    if let Some(gid) = chrome_group_id {
+        let tabs: Vec<crate::types::TabInfo> = oxichrome::tabs::query(
+            &crate::types::QueryByGroupId { group_id: gid },
+        )
+        .await
+        .map_err(|e| format!("Erreur de lecture des onglets : {:?}", e))?;
+
+        let tab_ids: Vec<i32> = tabs.iter().map(|t| t.id).collect();
+        if !tab_ids.is_empty() {
+            crate::ffi::tabs_ext::ungroup_tabs(&tab_ids)
+                .await
+                .map_err(|e| format!("Erreur de dissociation des onglets : {:?}", e))?;
+        }
+    }
+
+    // 3. Clear group_id in state
+    apply_dissolve_group(&mut state, &name)?;
+
+    // 4. Save
     crate::storage::save_state(&state).await;
 
     Ok(())
@@ -235,6 +326,86 @@ pub fn register_message_listener() {
                 });
             }
 
+            Ok(PopupCommand::CreateGroup { name }) => {
+                let send_fn = send_fn.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match handle_create_group(name).await {
+                        Ok(()) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: true,
+                                data: None,
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e) => {
+                                    oxichrome::log!(
+                                        "[messaging] CreateGroup response serialisation error: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: false,
+                                data: Some(e),
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e2) => {
+                                    oxichrome::log!(
+                                        "[messaging] CreateGroup error response serialisation error: {:?}",
+                                        e2
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            Ok(PopupCommand::DissolveGroup { name }) => {
+                let send_fn = send_fn.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match handle_dissolve_group(name).await {
+                        Ok(()) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: true,
+                                data: None,
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e) => {
+                                    oxichrome::log!(
+                                        "[messaging] DissolveGroup response serialisation error: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: false,
+                                data: Some(e),
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e2) => {
+                                    oxichrome::log!(
+                                        "[messaging] DissolveGroup error response serialisation error: {:?}",
+                                        e2
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
             Err(e) => {
                 oxichrome::log!(
                     "[messaging] Failed to parse PopupCommand: {:?}",
@@ -341,10 +512,181 @@ mod tests {
     }
 
     #[test]
+    fn test_popup_command_create_group_serialization() {
+        let cmd = PopupCommand::CreateGroup {
+            name: "My Group".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"createGroup","name":"My Group"}"#);
+    }
+
+    #[test]
+    fn test_popup_command_dissolve_group_serialization() {
+        let cmd = PopupCommand::DissolveGroup {
+            name: "github.com".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"dissolveGroup","name":"github.com"}"#);
+    }
+
+    #[test]
+    fn test_popup_command_create_group_roundtrip() {
+        let cmd = PopupCommand::CreateGroup {
+            name: "My Group".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: PopupCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PopupCommand::CreateGroup { name } => {
+                assert_eq!(name, "My Group");
+            }
+            _ => panic!("Expected CreateGroup"),
+        }
+    }
+
+    #[test]
+    fn test_popup_command_dissolve_group_roundtrip() {
+        let cmd = PopupCommand::DissolveGroup {
+            name: "github.com".into(),
+        };
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: PopupCommand = serde_json::from_str(&json).unwrap();
+        match parsed {
+            PopupCommand::DissolveGroup { name } => {
+                assert_eq!(name, "github.com");
+            }
+            _ => panic!("Expected DissolveGroup"),
+        }
+    }
+
+    #[test]
     fn test_popup_command_deserialize_unit_variants() {
         let cmd: PopupCommand = serde_json::from_str(r#"{"type":"runGrouping"}"#).unwrap();
         assert!(matches!(cmd, PopupCommand::RunGrouping));
         let cmd: PopupCommand = serde_json::from_str(r#"{"type":"getState"}"#).unwrap();
         assert!(matches!(cmd, PopupCommand::GetState));
+    }
+
+    // ── apply_create_group tests ──
+
+    #[test]
+    fn test_apply_create_group_new() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let added = apply_create_group(&mut state, "github.com", 1000.0);
+        assert!(added, "new group must return true");
+        assert_eq!(state.groups.len(), 1);
+        assert_eq!(state.groups[0].name, "github.com");
+        assert_eq!(state.groups[0].manual, true);
+        assert_eq!(state.groups[0].group_id, None);
+        assert_eq!(
+            state.groups[0].display_name,
+            Some("github.com".to_string())
+        );
+        assert_eq!(state.groups[0].created_at_ms, 1000.0);
+        assert_eq!(state.groups[0].updated_at_ms, 1000.0);
+    }
+
+    #[test]
+    fn test_apply_create_group_idempotent() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![crate::types::StoredGroup {
+                name: "github.com".into(),
+                keywords: vec![],
+                created_at_ms: 500.0,
+                updated_at_ms: 500.0,
+                group_id: Some(42),
+                display_name: None,
+                theme: String::new(),
+                color: None,
+                manual: false,
+            }],
+        };
+        let added = apply_create_group(&mut state, "github.com", 2000.0);
+        assert!(!added, "duplicate group must return false");
+        assert_eq!(state.groups.len(), 1, "no duplicate added");
+        // Existing group unchanged
+        assert_eq!(state.groups[0].group_id, Some(42));
+        assert_eq!(state.groups[0].created_at_ms, 500.0);
+    }
+
+    #[test]
+    fn test_apply_create_group_with_existing_other_groups() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![crate::types::StoredGroup {
+                name: "docs.rs".into(),
+                keywords: vec![],
+                created_at_ms: 500.0,
+                updated_at_ms: 500.0,
+                group_id: Some(10),
+                display_name: None,
+                theme: String::new(),
+                color: None,
+                manual: false,
+            }],
+        };
+        let added = apply_create_group(&mut state, "github.com", 2000.0);
+        assert!(added);
+        assert_eq!(state.groups.len(), 2);
+        assert_eq!(state.groups[1].name, "github.com");
+        assert_eq!(state.groups[1].manual, true);
+    }
+
+    // ── apply_dissolve_group tests ──
+
+    #[test]
+    fn test_apply_dissolve_group_clears_group_id() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![crate::types::StoredGroup {
+                name: "github.com".into(),
+                keywords: vec![],
+                created_at_ms: 1000.0,
+                updated_at_ms: 1000.0,
+                group_id: Some(42),
+                display_name: None,
+                theme: String::new(),
+                color: None,
+                manual: false,
+            }],
+        };
+        let result = apply_dissolve_group(&mut state, "github.com");
+        assert!(result.is_ok());
+        assert_eq!(state.groups[0].group_id, None);
+    }
+
+    #[test]
+    fn test_apply_dissolve_group_already_none() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![crate::types::StoredGroup {
+                name: "github.com".into(),
+                keywords: vec![],
+                created_at_ms: 1000.0,
+                updated_at_ms: 1000.0,
+                group_id: None,
+                display_name: None,
+                theme: String::new(),
+                color: None,
+                manual: false,
+            }],
+        };
+        let result = apply_dissolve_group(&mut state, "github.com");
+        assert!(result.is_ok(), "dissolving a group with group_id None must succeed");
+        assert_eq!(state.groups[0].group_id, None);
+    }
+
+    #[test]
+    fn test_apply_dissolve_group_not_found() {
+        let mut state = crate::types::GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let result = apply_dissolve_group(&mut state, "nonexistent");
+        assert!(result.is_err(), "dissolving a non-existent group must return error");
     }
 }
