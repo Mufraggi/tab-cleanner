@@ -68,7 +68,7 @@ pub async fn apply_groups(
                 // 2a — Try to add tabs to existing Chrome group
                 match tabs_ext::create_tab_group(&tab_ids, Some(gid)).await {
                     Ok(_) => {
-                        apply_group_properties(gid, &group.name).await;
+                        apply_group_properties(gid, &group.name, group.color.as_deref()).await;
                     }
                     Err(e) => {
                         oxichrome::log!(
@@ -99,6 +99,9 @@ pub async fn apply_groups(
             created_at_ms: js_sys::Date::now(),
             updated_at_ms: js_sys::Date::now(),
             group_id: None,
+            display_name: None,
+            theme: String::new(),
+            color: None,
         };
         create_new_group_and_update(&mut new_group, &tab_ids).await;
         updated_groups.push(new_group);
@@ -129,7 +132,7 @@ async fn create_new_group_and_update(group: &mut StoredGroup, tab_ids: &[i32]) {
     match tabs_ext::create_tab_group(tab_ids, None).await {
         Ok(new_id) => {
             group.group_id = Some(new_id);
-            apply_group_properties(new_id, &group.name).await;
+            apply_group_properties(new_id, &group.name, group.color.as_deref()).await;
         }
         Err(e) => {
             oxichrome::log!(
@@ -143,10 +146,12 @@ async fn create_new_group_and_update(group: &mut StoredGroup, tab_ids: &[i32]) {
 
 /// Update the title and colour of an existing Chrome tab group.
 ///
+/// `color_override` if present, takes precedence over the deterministic `pick_color()`.
 /// All errors are logged; the function never panics.
-async fn apply_group_properties(group_id: i32, name: &str) {
+async fn apply_group_properties(group_id: i32, name: &str, color_override: Option<&str>) {
+    let color = color_override.unwrap_or_else(|| pick_color(name));
     let props = tab_groups::UpdateProperties {
-        color: Some(pick_color(name).to_string()),
+        color: Some(color.to_string()),
         title: Some(name.to_string()),
     };
     if let Err(e) = tab_groups::update_tab_group(group_id, &props).await {

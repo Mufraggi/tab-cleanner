@@ -33,6 +33,9 @@ mod tests {
                     created_at_ms: 1718100000000.0,
                     updated_at_ms: 1718100000000.0,
                     group_id: None,
+                    display_name: None,
+                    theme: String::new(),
+                    color: None,
                 },
             ],
         };

@@ -1,5 +1,8 @@
 use serde::{Deserialize, Serialize};
 
+/// Helper to default ungrouped Chrome tab groupId to -1.
+fn no_group() -> i32 { -1 }
+
 /// What we query Chrome for — minimal fields needed for grouping.
 /// `allow(dead_code)` because `title` is only used for keyword extraction
 /// and `url` is only consumed by the domain extractor.
@@ -9,6 +12,9 @@ pub struct TabInfo {
     pub id: i32,
     pub url: Option<String>,    // None for new-tab page, chrome://, etc.
     pub title: Option<String>,  // None for tabs without a title
+    /// The Chrome tab group this tab belongs to, or -1 if ungrouped.
+    #[serde(default = "no_group")]
+    pub group_id: i32,
 }
 
 /// Input to tabs::query.
@@ -46,6 +52,19 @@ pub struct StoredGroup {
     /// `None` for groups that haven't been materialised yet.
     #[serde(default)]
     pub group_id: Option<i32>,
+
+    /// Optional display name shown in the UI instead of the domain `name`.
+    /// `None` means the UI should display `name` (the domain).
+    #[serde(default)]
+    pub display_name: Option<String>,
+
+    /// Theme colour for the group. Empty string means default / unset.
+    #[serde(default)]
+    pub theme: String,
+
+    /// User colour override. If None, the deterministic pick_color() is used.
+    #[serde(default)]
+    pub color: Option<String>,
 }
 
 /// Top-level persistence payload stored under GROUP_STATE_KEY.
@@ -91,5 +110,43 @@ mod tests {
         }"#;
         let group: StoredGroup = serde_json::from_str(json).expect("deserialize with group_id");
         assert_eq!(group.group_id, Some(42));
+        // display_name and theme not in JSON → must default
+        assert_eq!(group.display_name, None);
+        assert_eq!(group.theme, "");
+    }
+
+    #[test]
+    fn test_stored_group_deserialize_without_display_name_and_theme() {
+        // Old JSON without display_name and theme fields
+        // Must deserialize to default values: None and ""
+        let json = r#"{
+            "name": "youtube.com",
+            "keywords": ["video"],
+            "created_at_ms": 1000.0,
+            "updated_at_ms": 2000.0,
+            "group_id": 7
+        }"#;
+        let group: StoredGroup = serde_json::from_str(json).expect("deserialize old JSON");
+        assert_eq!(group.name, "youtube.com");
+        assert_eq!(group.keywords, vec!["video"]);
+        assert_eq!(group.group_id, Some(7));
+        assert_eq!(group.display_name, None, "missing display_name must default to None");
+        assert_eq!(group.theme, "", "missing theme must default to empty string");
+    }
+
+    #[test]
+    fn test_stored_group_deserialize_without_color() {
+        // Old JSON without color field — must deserialize to None
+        let json = r#"{
+            "name": "github.com",
+            "keywords": ["rust"],
+            "created_at_ms": 1000.0,
+            "updated_at_ms": 2000.0,
+            "group_id": 42,
+            "display_name": null,
+            "theme": ""
+        }"#;
+        let group: StoredGroup = serde_json::from_str(json).expect("deserialize");
+        assert_eq!(group.color, None);
     }
 }

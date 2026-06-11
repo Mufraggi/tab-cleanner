@@ -200,6 +200,9 @@ pub fn reconcile(
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             group_id: None,
+            display_name: None,
+            theme: String::new(),
+            color: None,
         });
     }
 
@@ -242,6 +245,7 @@ mod tests {
             id,
             url: url.map(|s| s.to_string()),
             title: title.map(|s| s.to_string()),
+            group_id: 0,
         }
     }
 
@@ -404,6 +408,31 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
+    fn test_reconcile_preserves_color() {
+        let stored = GroupState {
+            version: 1,
+            groups: vec![StoredGroup {
+                name: "github.com".into(),
+                keywords: vec!["rust".into()],
+                created_at_ms: 1000.0,
+                updated_at_ms: 1000.0,
+                group_id: Some(42),
+                display_name: None,
+                theme: String::new(),
+                color: Some("blue".into()),
+            }],
+        };
+        let fresh = vec![GroupAssignment {
+            tab_id: 1,
+            group_name: "github.com".into(),
+            domain: Some("github.com".into()),
+            keywords: vec!["rust".into()],
+        }];
+        let result = reconcile(&fresh, &stored, 2000.0);
+        assert_eq!(result.groups[0].color, Some("blue".into()));
+    }
+
+    #[test]
     fn test_reconcile_preserves_existing_group_id() {
         // Stored group has group_id = Some(42), fresh includes that group.
         // Result must keep group_id = Some(42).
@@ -415,6 +444,9 @@ mod tests {
                 created_at_ms: 1000.0,
                 updated_at_ms: 1000.0,
                 group_id: Some(42),
+                display_name: None,
+                theme: String::new(),
+                color: None,
             }],
         };
         let fresh = vec![GroupAssignment {
@@ -426,6 +458,36 @@ mod tests {
         let result = reconcile(&fresh, &stored, 2000.0);
         assert_eq!(result.groups.len(), 1);
         assert_eq!(result.groups[0].group_id, Some(42));
+    }
+
+    #[test]
+    fn test_reconcile_preserves_display_name_and_theme() {
+        // Stored group with display_name = Some("YouTube") and theme = "blue"
+        // must keep both after reconcile.
+        let stored = GroupState {
+            version: 1,
+            groups: vec![StoredGroup {
+                name: "youtube.com".into(),
+                keywords: vec!["video".into()],
+                created_at_ms: 1000.0,
+                updated_at_ms: 1000.0,
+                group_id: Some(5),
+                display_name: Some("YouTube".into()),
+                theme: "blue".into(),
+                color: None,
+            }],
+        };
+        let fresh = vec![GroupAssignment {
+            tab_id: 1,
+            group_name: "youtube.com".into(),
+            domain: Some("youtube.com".into()),
+            keywords: vec!["video".into()],
+        }];
+        let result = reconcile(&fresh, &stored, 2000.0);
+        assert_eq!(result.groups.len(), 1);
+        assert_eq!(result.groups[0].display_name, Some("YouTube".into()));
+        assert_eq!(result.groups[0].theme, "blue");
+        assert_eq!(result.groups[0].group_id, Some(5));
     }
 
     #[test]
@@ -471,6 +533,9 @@ mod tests {
                 created_at_ms: 1000.0,
                 updated_at_ms: 1000.0,
                 group_id: None,
+                display_name: None,
+                theme: String::new(),
+                color: None,
             }],
         };
         let fresh = vec![
@@ -508,6 +573,9 @@ mod tests {
                 created_at_ms: 1000.0,
                 updated_at_ms: 1000.0,
                 group_id: None,
+                display_name: None,
+                theme: String::new(),
+                color: None,
             }],
         };
         let fresh = vec![
@@ -539,6 +607,9 @@ mod tests {
                     created_at_ms: 1000.0,
                     updated_at_ms: 1000.0,
                     group_id: None,
+                    display_name: None,
+                    theme: String::new(),
+                    color: None,
                 },
                 StoredGroup {
                     name: "old-domain.com".into(),
@@ -546,6 +617,9 @@ mod tests {
                     created_at_ms: 500.0,
                     updated_at_ms: 500.0,
                     group_id: None,
+                    display_name: None,
+                    theme: String::new(),
+                    color: None,
                 },
             ],
         };
@@ -593,6 +667,9 @@ mod tests {
                 created_at_ms: 1000.0,
                 updated_at_ms: 1000.0,
                 group_id: None,
+                display_name: None,
+                theme: String::new(),
+                color: None,
             }],
         };
         let fresh: Vec<GroupAssignment> = vec![];
@@ -775,6 +852,9 @@ mod tests {
                 created_at_ms: 500.0,
                 updated_at_ms: 500.0,
                 group_id: None,
+                display_name: None,
+                theme: String::new(),
+                color: None,
             }],
         };
 
