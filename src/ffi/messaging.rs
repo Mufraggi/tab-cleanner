@@ -9,6 +9,12 @@ extern "C" {
     fn add_on_message_listener(callback: &JsValue);
 }
 
+/// HuggingFace CDN URLs for the sentence-transformers model.
+const MODEL_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors";
+const TOKENIZER_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
+
 /// Commands the popup can send to the background service worker.
 ///
 /// Each variant is dispatched via `serde_wasm_bindgen` using the `"type"` tag
@@ -16,8 +22,6 @@ extern "C" {
 #[derive(Debug, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "camelCase")]
 pub enum PopupCommand {
-    /// Run the full grouping pipeline and persist state.
-    RunGrouping,
     /// Retrieve the persisted group state.
     GetState,
     /// Update properties of a persisted group (name, display_name, color, theme).
@@ -37,11 +41,20 @@ pub enum PopupCommand {
     /// Create a new empty manual group.
     CreateGroup {
         name: String,
+        /// Theme description for SML-based grouping.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        theme: Option<String>,
     },
     /// Dissolve an existing group (ungroup its tabs, keep the group entry).
     DissolveGroup {
         name: String,
     },
+    /// Run semantic grouping: SML first, then heuristic fallback.
+    RunSemanticGrouping,
+    /// Download model weights + tokenizer from HuggingFace CDN into Cache API.
+    DownloadModel,
+    /// Check whether model + tokenizer are already cached.
+    CheckModelCached,
 }
 
 /// Response sent back to the popup after handling a command.
@@ -127,7 +140,7 @@ async fn handle_update_group(
 /// Pure logic: add a new manual group to the state.
 ///
 /// Returns `true` if the group was added, `false` if it already existed (idempotent).
-pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, now_ms: f64) -> bool {
+pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, theme: Option<&str>, now_ms: f64) -> bool {
     if state.groups.iter().any(|g| g.name == name) {
         return false; // already exists — idempotent
     }
@@ -138,7 +151,7 @@ pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, now_
         updated_at_ms: now_ms,
         group_id: None,
         display_name: Some(name.to_string()),
-        theme: String::new(),
+        theme: theme.unwrap_or("").to_string(),
         color: None,
         manual: true,
     });
@@ -146,9 +159,9 @@ pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, now_
 }
 
 /// Async handler: create a new manual group.
-async fn handle_create_group(name: String) -> Result<(), String> {
+async fn handle_create_group(name: String, theme: Option<String>) -> Result<(), String> {
     let mut state = crate::storage::load_state().await;
-    let _ = apply_create_group(&mut state, &name, js_sys::Date::now());
+    let _ = apply_create_group(&mut state, &name, theme.as_deref(), js_sys::Date::now());
     crate::storage::save_state(&state).await;
     Ok(())
 }
@@ -207,6 +220,31 @@ async fn handle_dissolve_group(name: String) -> Result<(), String> {
     Ok(())
 }
 
+/// Download the model.safetensors and tokenizer.json from HuggingFace CDN into the Cache API.
+///
+/// Returns `Ok("downloaded")` when both files are cached (either from cache or network).
+async fn handle_download_model() -> Result<String, String> {
+    let src1 = crate::sml::ensure_model_cached(MODEL_URL).await
+        .map_err(|e| format!("Echec du telechargement du modele : {}", e))?;
+    let src2 = crate::sml::ensure_model_cached(TOKENIZER_URL).await
+        .map_err(|e| format!("Echec du telechargement du tokenizer : {}", e))?;
+    oxichrome::log!(
+        "[messaging] Model cache: {} (model), {} (tokenizer)",
+        src1,
+        src2
+    );
+    Ok("downloaded".to_string())
+}
+
+/// Check if both model.safetensors and tokenizer.json are cached.
+///
+/// This is a lightweight operation — it only performs `cache.match()`, not actual loading.
+async fn is_model_cached() -> bool {
+    let model_ok = crate::sml::model_cache::is_url_cached(MODEL_URL).await;
+    let tokenizer_ok = crate::sml::model_cache::is_url_cached(TOKENIZER_URL).await;
+    model_ok && tokenizer_ok
+}
+
 /// Register the `chrome.runtime.onMessage` listener for popup ↔ background communication.
 ///
 /// Must be called once during background startup (from `start()`).
@@ -230,28 +268,6 @@ pub fn register_message_listener() {
         let send_fn: js_sys::Function = send_response.into();
 
         match serde_wasm_bindgen::from_value::<PopupCommand>(message) {
-            Ok(PopupCommand::RunGrouping) => {
-                let send_fn = send_fn.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    let _ = crate::run_grouping().await;
-
-                    match serde_wasm_bindgen::to_value(&MessagingResponse {
-                        success: true,
-                        data: None,
-                    }) {
-                        Ok(val) => {
-                            let _ = send_fn.call1(&JsValue::NULL, &val);
-                        }
-                        Err(e) => {
-                            oxichrome::log!(
-                                "[messaging] RunGrouping response serialisation error: {:?}",
-                                e
-                            );
-                        }
-                    }
-                });
-            }
-
             Ok(PopupCommand::GetState) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
@@ -326,10 +342,10 @@ pub fn register_message_listener() {
                 });
             }
 
-            Ok(PopupCommand::CreateGroup { name }) => {
+            Ok(PopupCommand::CreateGroup { name, theme }) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match handle_create_group(name).await {
+                    match handle_create_group(name, theme).await {
                         Ok(()) => {
                             match serde_wasm_bindgen::to_value(&MessagingResponse {
                                 success: true,
@@ -406,6 +422,107 @@ pub fn register_message_listener() {
                 });
             }
 
+            Ok(PopupCommand::RunSemanticGrouping) => {
+                let send_fn = send_fn.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match crate::semantic::run_semantic_grouping().await {
+                        Ok(_) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: true,
+                                data: None,
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e) => {
+                                    oxichrome::log!(
+                                        "[messaging] RunSemanticGrouping response serialisation error: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: false,
+                                data: Some(e),
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e2) => {
+                                    oxichrome::log!(
+                                        "[messaging] RunSemanticGrouping error serialisation error: {:?}",
+                                        e2
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            Ok(PopupCommand::DownloadModel) => {
+                let send_fn = send_fn.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    match handle_download_model().await {
+                        Ok(msg) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: true,
+                                data: Some(msg),
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e) => {
+                                    oxichrome::log!(
+                                        "[messaging] DownloadModel response serialisation error: {:?}",
+                                        e
+                                    );
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            match serde_wasm_bindgen::to_value(&MessagingResponse {
+                                success: false,
+                                data: Some(e),
+                            }) {
+                                Ok(val) => {
+                                    let _ = send_fn.call1(&JsValue::NULL, &val);
+                                }
+                                Err(e2) => {
+                                    oxichrome::log!(
+                                        "[messaging] DownloadModel error serialisation error: {:?}",
+                                        e2
+                                    );
+                                }
+                            }
+                        }
+                    }
+                });
+            }
+
+            Ok(PopupCommand::CheckModelCached) => {
+                let send_fn = send_fn.clone();
+                wasm_bindgen_futures::spawn_local(async move {
+                    let cached = is_model_cached().await;
+                    match serde_wasm_bindgen::to_value(&MessagingResponse {
+                        success: true,
+                        data: Some(if cached { "true" } else { "false" }.to_string()),
+                    }) {
+                        Ok(val) => {
+                            let _ = send_fn.call1(&JsValue::NULL, &val);
+                        }
+                        Err(e) => {
+                            oxichrome::log!(
+                                "[messaging] CheckModelCached response serialisation error: {:?}",
+                                e
+                            );
+                        }
+                    }
+                });
+            }
+
             Err(e) => {
                 oxichrome::log!(
                     "[messaging] Failed to parse PopupCommand: {:?}",
@@ -440,13 +557,6 @@ pub fn register_message_listener() {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_popup_command_run_grouping_serialization() {
-        let cmd = PopupCommand::RunGrouping;
-        let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"type":"runGrouping"}"#);
-    }
 
     #[test]
     fn test_popup_command_get_state_serialization() {
@@ -515,9 +625,10 @@ mod tests {
     fn test_popup_command_create_group_serialization() {
         let cmd = PopupCommand::CreateGroup {
             name: "My Group".into(),
+            theme: Some("coding projects".into()),
         };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert_eq!(json, r#"{"type":"createGroup","name":"My Group"}"#);
+        assert_eq!(json, r#"{"type":"createGroup","name":"My Group","theme":"coding projects"}"#);
     }
 
     #[test]
@@ -533,12 +644,14 @@ mod tests {
     fn test_popup_command_create_group_roundtrip() {
         let cmd = PopupCommand::CreateGroup {
             name: "My Group".into(),
+            theme: Some("coding projects".into()),
         };
         let json = serde_json::to_string(&cmd).unwrap();
         let parsed: PopupCommand = serde_json::from_str(&json).unwrap();
         match parsed {
-            PopupCommand::CreateGroup { name } => {
+            PopupCommand::CreateGroup { name, theme } => {
                 assert_eq!(name, "My Group");
+                assert_eq!(theme, Some("coding projects".to_string()));
             }
             _ => panic!("Expected CreateGroup"),
         }
@@ -561,10 +674,47 @@ mod tests {
 
     #[test]
     fn test_popup_command_deserialize_unit_variants() {
-        let cmd: PopupCommand = serde_json::from_str(r#"{"type":"runGrouping"}"#).unwrap();
-        assert!(matches!(cmd, PopupCommand::RunGrouping));
         let cmd: PopupCommand = serde_json::from_str(r#"{"type":"getState"}"#).unwrap();
         assert!(matches!(cmd, PopupCommand::GetState));
+    }
+
+    #[test]
+    fn test_popup_command_run_semantic_grouping_serialization() {
+        let cmd = PopupCommand::RunSemanticGrouping;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"runSemanticGrouping"}"#);
+    }
+
+    #[test]
+    fn test_popup_command_download_model_serialization() {
+        let cmd = PopupCommand::DownloadModel;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"downloadModel"}"#);
+    }
+
+    #[test]
+    fn test_popup_command_check_model_cached_serialization() {
+        let cmd = PopupCommand::CheckModelCached;
+        let json = serde_json::to_string(&cmd).unwrap();
+        assert_eq!(json, r#"{"type":"checkModelCached"}"#);
+    }
+
+    #[test]
+    fn test_popup_command_deserialize_new_unit_variants() {
+        let cmd: PopupCommand = serde_json::from_str(r#"{"type":"runSemanticGrouping"}"#).unwrap();
+        assert!(matches!(cmd, PopupCommand::RunSemanticGrouping));
+        let cmd: PopupCommand = serde_json::from_str(r#"{"type":"downloadModel"}"#).unwrap();
+        assert!(matches!(cmd, PopupCommand::DownloadModel));
+        let cmd: PopupCommand = serde_json::from_str(r#"{"type":"checkModelCached"}"#).unwrap();
+        assert!(matches!(cmd, PopupCommand::CheckModelCached));
+    }
+
+    #[test]
+    fn test_popup_command_roundtrip_run_semantic_grouping() {
+        let cmd = PopupCommand::RunSemanticGrouping;
+        let json = serde_json::to_string(&cmd).unwrap();
+        let parsed: PopupCommand = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, PopupCommand::RunSemanticGrouping));
     }
 
     // ── apply_create_group tests ──
@@ -575,10 +725,11 @@ mod tests {
             version: 1,
             groups: vec![],
         };
-        let added = apply_create_group(&mut state, "github.com", 1000.0);
+        let added = apply_create_group(&mut state, "github.com", Some("coding"), 1000.0);
         assert!(added, "new group must return true");
         assert_eq!(state.groups.len(), 1);
         assert_eq!(state.groups[0].name, "github.com");
+        assert_eq!(state.groups[0].theme, "coding");
         assert_eq!(state.groups[0].manual, true);
         assert_eq!(state.groups[0].group_id, None);
         assert_eq!(
@@ -605,7 +756,7 @@ mod tests {
                 manual: false,
             }],
         };
-        let added = apply_create_group(&mut state, "github.com", 2000.0);
+        let added = apply_create_group(&mut state, "github.com", None, 2000.0);
         assert!(!added, "duplicate group must return false");
         assert_eq!(state.groups.len(), 1, "no duplicate added");
         // Existing group unchanged
@@ -629,7 +780,7 @@ mod tests {
                 manual: false,
             }],
         };
-        let added = apply_create_group(&mut state, "github.com", 2000.0);
+        let added = apply_create_group(&mut state, "github.com", None, 2000.0);
         assert!(added);
         assert_eq!(state.groups.len(), 2);
         assert_eq!(state.groups[1].name, "github.com");

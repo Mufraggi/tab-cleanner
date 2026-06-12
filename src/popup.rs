@@ -1,10 +1,62 @@
 use leptos::prelude::*;
 use oxichrome::{runtime, storage, tabs};
 use serde_wasm_bindgen;
+use wasm_bindgen::JsValue;
 
 use crate::ffi::messaging::{MessagingResponse, PopupCommand};
 use crate::grouping::apply::pick_color;
-use crate::types::{GroupState, GROUP_STATE_KEY, QueryAllTabs, TabInfo};
+use crate::types::{GroupState, GROUP_STATE_KEY, ONBOARDING_DONE_KEY, QueryAllTabs, TabInfo};
+
+// ── Retry helper for service-worker wake-up ──
+
+/// Maximum number of send attempts (1 initial + 4 retries).
+const MAX_RETRY_ATTEMPTS: u32 = 5;
+
+/// Returns `true` when the error is the MV3 "service worker sleeping" error.
+fn is_connection_error(e: &oxichrome::OxichromeError) -> bool {
+    let s = format!("{:?}", e);
+    s.contains("Receiving end does not exist")
+        || s.contains("Could not establish connection")
+}
+
+/// Async sleep for `ms` milliseconds using `setTimeout`.
+async fn sleep_ms(ms: i32) {
+    let promise = js_sys::Promise::new(&mut |resolve, _| {
+        if let Some(window) = web_sys::window() {
+            let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                &resolve, ms,
+            );
+        }
+    });
+    let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
+}
+
+/// Send a message to the background service worker with automatic retry
+/// when the worker is sleeping (MV3).
+///
+/// On errors matching "Receiving end does not exist" or "Could not establish
+/// connection", the function waits with exponential backoff and retries up to
+/// `MAX_RETRY_ATTEMPTS` times.  Other errors are returned immediately.
+///
+/// Backoff delays: 100 ms, 200 ms, 400 ms, 800 ms, 1600 ms.
+async fn send_message_with_retry(cmd: &PopupCommand) -> Result<JsValue, oxichrome::OxichromeError> {
+    let mut attempt: u32 = 0;
+    loop {
+        match runtime::send_message(cmd).await {
+            Ok(val) => return Ok(val),
+            Err(e) => {
+                if is_connection_error(&e) && attempt < MAX_RETRY_ATTEMPTS {
+                    attempt += 1;
+                    // Exponential backoff: 100, 200, 400, 800, 1600 ms
+                    let delay_ms = 100_i32 * 2_i32.pow(attempt - 1);
+                    sleep_ms(delay_ms).await;
+                    continue;
+                }
+                return Err(e);
+            }
+        }
+    }
+}
 
 // ── Chrome tab group colour palette (hex) ──
 pub const HEX: &[(&str, &str)] = &[
@@ -134,10 +186,9 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
     })
 }
 
-// ── Send RunGrouping command ──
-
-pub async fn trigger_run_grouping() -> Result<(), String> {
-    let resp_js = runtime::send_message(&PopupCommand::RunGrouping)
+/// Send RunSemanticGrouping command to the background service worker.
+pub async fn trigger_semantic_grouping() -> Result<(), String> {
+    let resp_js = send_message_with_retry(&PopupCommand::RunSemanticGrouping)
         .await
         .map_err(|e| format!("Echec d'envoi : {:?}", e))?;
 
@@ -145,10 +196,30 @@ pub async fn trigger_run_grouping() -> Result<(), String> {
         .map_err(|e| format!("Reponse invalide : {:?}", e))?;
 
     if !resp.success {
-        let msg = resp.data.unwrap_or_else(|| "Echec du rangement".to_string());
+        let msg = resp.data.unwrap_or_else(|| "Echec du tri semantique".to_string());
         return Err(msg);
     }
     Ok(())
+}
+
+/// Check whether the model is cached by querying the background worker.
+pub async fn check_model_cached() -> Result<bool, String> {
+    let resp_js = send_message_with_retry(&PopupCommand::CheckModelCached)
+        .await
+        .map_err(|e| format!("Echec d'envoi : {:?}", e))?;
+
+    let resp: MessagingResponse = serde_wasm_bindgen::from_value(resp_js)
+        .map_err(|e| format!("Reponse invalide : {:?}", e))?;
+
+    if !resp.success {
+        let msg = resp.data.unwrap_or_else(|| "Echec de la verification".to_string());
+        return Err(msg);
+    }
+
+    match resp.data.as_deref() {
+        Some("true") => Ok(true),
+        _ => Ok(false),
+    }
 }
 
 /// Send an UpdateGroup command to the background service worker.
@@ -164,7 +235,7 @@ pub async fn send_update_group(
         color,
         theme,
     };
-    let resp_js = runtime::send_message(&cmd)
+    let resp_js = send_message_with_retry(&cmd)
         .await
         .map_err(|e| format!("Echec d'envoi : {:?}", e))?;
 
@@ -244,9 +315,9 @@ pub async fn send_update_group_best_effort(
 /// Create a new manual group directly in storage.
 ///
 /// Reads `GroupState` from storage, checks for duplicates (idempotent),
-/// appends a new `StoredGroup` with `manual: true`, and writes back.
+/// appends a new `StoredGroup` with `manual: true` and the provided `theme`, and writes back.
 /// Returns an error if storage operations fail.
-pub async fn persist_create_group(name: &str) -> Result<(), String> {
+pub async fn persist_create_group(name: &str, theme: &str) -> Result<(), String> {
     let mut state: GroupState = storage::get::<GroupState>(GROUP_STATE_KEY)
         .await
         .map_err(|e| format!("Erreur de lecture du storage : {:?}", e))?
@@ -268,7 +339,7 @@ pub async fn persist_create_group(name: &str) -> Result<(), String> {
         updated_at_ms: now,
         group_id: None,
         display_name: Some(name.to_string()),
-        theme: String::new(),
+        theme: theme.to_string(),
         color: None,
         manual: true,
     });
@@ -280,13 +351,108 @@ pub async fn persist_create_group(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// Check whether the onboarding has been completed.
+/// Returns `false` if the key is absent or deserialisation fails.
+pub async fn is_onboarding_done() -> bool {
+    storage::get::<bool>(ONBOARDING_DONE_KEY)
+        .await
+        .unwrap_or(None)
+        .unwrap_or(false)
+}
+
+/// Persist the onboarding-done marker.
+/// Fire-and-forget on error; errors are logged via `oxichrome::log!`.
+pub async fn set_onboarding_done() {
+    if let Err(e) = storage::set(ONBOARDING_DONE_KEY, &true).await {
+        oxichrome::log!("[popup] set_onboarding_done failed: {:?}", e);
+    }
+}
+
+/// Batch-create manual groups from onboarding theme selections.
+///
+/// Reads `GroupState` once, appends new groups for each `(name, theme)` pair
+/// that does not already exist, and writes `GroupState` back in a single operation.
+/// This avoids N storage writes that `persist_create_group` would perform for N groups.
+///
+/// **Note**: if the `StoredGroup` struct gains new fields, both this function
+/// and `persist_create_group` must be updated.
+pub async fn persist_create_groups_batch(names_and_themes: &[(String, String)]) -> Result<(), String> {
+    let mut state: GroupState = storage::get::<GroupState>(GROUP_STATE_KEY)
+        .await
+        .map_err(|e| format!("Erreur de lecture du storage : {:?}", e))?
+        .unwrap_or_else(|| GroupState {
+            version: 1,
+            groups: vec![],
+        });
+
+    let mut added = 0usize;
+    let now = js_sys::Date::now();
+    for (name, theme) in names_and_themes {
+        // Idempotent: skip if group already exists
+        if state.groups.iter().any(|g| g.name == *name) {
+            continue;
+        }
+        state.groups.push(crate::types::StoredGroup {
+            name: name.to_string(),
+            keywords: vec![],
+            created_at_ms: now,
+            updated_at_ms: now,
+            group_id: None,
+            display_name: Some(name.to_string()),
+            theme: theme.to_string(),
+            color: None,
+            manual: true,
+        });
+        added += 1;
+    }
+
+    if added > 0 {
+        storage::set(GROUP_STATE_KEY, &state)
+            .await
+            .map_err(|e| format!("Erreur d'écriture du storage : {:?}", e))?;
+    }
+
+    Ok(())
+}
+
+/// Pure merge helper: applies `names_and_themes` to a `GroupState` in-memory.
+/// Returns the number of groups that were actually added (skipping duplicates).
+///
+/// This is extracted for testability so that the merge logic can be verified
+/// without mocking Chrome storage.
+pub fn apply_create_groups_batch(
+    state: &mut GroupState,
+    names_and_themes: &[(String, String)],
+    now_ms: f64,
+) -> usize {
+    let mut added = 0usize;
+    for (name, theme) in names_and_themes {
+        if state.groups.iter().any(|g| g.name == *name) {
+            continue;
+        }
+        state.groups.push(crate::types::StoredGroup {
+            name: name.to_string(),
+            keywords: vec![],
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            group_id: None,
+            display_name: Some(name.to_string()),
+            theme: theme.to_string(),
+            color: None,
+            manual: true,
+        });
+        added += 1;
+    }
+    added
+}
+
 /// Best-effort variant to send a `DissolveGroup` command to the background worker.
 ///
 /// If the worker is sleeping (MV3), the send fails silently.
 /// Errors are logged via `oxichrome::log!` but never surfaced to the user.
 pub async fn send_dissolve_group_best_effort(name: String) {
     let cmd = PopupCommand::DissolveGroup { name };
-    match runtime::send_message(&cmd).await {
+    match send_message_with_retry(&cmd).await {
         Ok(resp_js) => {
             let _resp: MessagingResponse = serde_wasm_bindgen::from_value(resp_js).unwrap_or_else(|e| {
                 oxichrome::log!(
@@ -637,6 +803,81 @@ pub fn render_content(
                 }
             })
         }}
+    }
+}
+
+// ── Onboarding render ──
+
+pub fn render_onboarding(
+    onboarding_selected: RwSignal<Vec<usize>>,
+    on_commencer: impl Fn() + 'static + Clone,
+    on_passer: impl Fn() + 'static + Clone,
+) -> impl IntoView {
+    use crate::types::ONBOARDING_THEMES;
+
+    let can_commencer = move || !onboarding_selected.with(|v| v.is_empty());
+
+    view! {
+        <div class="tc-onboarding">
+            <div class="tc-onboarding-title">
+                "Bienvenue ! Choisis les themes qui t'interessent"
+            </div>
+            <div class="tc-onboarding-sub">
+                "Selectionne les themes que tu souhaites suivre. Des groupes seront crees automatiquement."
+            </div>
+            <div class="tc-onboarding-grid">
+                {
+                    ONBOARDING_THEMES.iter().enumerate().map(|(i, (name, theme))| {
+                        let toggle = {
+                            let os = onboarding_selected;
+                            move |_| {
+                                let mut sel = os.get();
+                                if let Some(pos) = sel.iter().position(|x| *x == i) {
+                                    sel.remove(pos);
+                                } else {
+                                    sel.push(i);
+                                }
+                                os.set(sel);
+                            }
+                        };
+                        let is_sel = move || onboarding_selected.with(|v| v.contains(&i));
+                        let preview = if theme.len() > 60 {
+                            format!("{}…", &theme[..60])
+                        } else {
+                            theme.to_string()
+                        };
+                        view! {
+                            <div
+                                class="tc-onboarding-card"
+                                class:tc-onboarding-card--selected=is_sel
+                                on:click=toggle
+                            >
+                                <span class="tc-onboarding-card-name">{name.to_string()}</span>
+                                <span class="tc-onboarding-card-preview">{preview}</span>
+                                {move || if is_sel() {
+                                    view! { <span class="tc-onboarding-check">"✓"</span> }.into_any()
+                                } else {
+                                    view! {}.into_any()
+                                }}
+                            </div>
+                        }.into_any()
+                    }).collect::<Vec<_>>()
+                }
+            </div>
+            <button
+                class="tc-onboarding-commencer"
+                disabled=move || !can_commencer()
+                on:click=move |_| on_commencer()
+            >
+                "Commencer"
+            </button>
+            <button
+                class="tc-onboarding-passer"
+                on:click=move |_| on_passer()
+            >
+                "Passer"
+            </button>
+        </div>
     }
 }
 
@@ -1005,12 +1246,12 @@ pub const CSS: &str = r#"
     color: #e7e9ee;
     border-color: #4f6ef0;
 }
-.tc-new-group-row {
+.tc-new-group-form {
     display: flex;
+    flex-direction: column;
     gap: 8px;
 }
 .tc-new-group-input {
-    flex: 1;
     background: #171a21;
     border: 1px solid #4f6ef0;
     border-radius: 8px;
@@ -1020,6 +1261,20 @@ pub const CSS: &str = r#"
     outline: none;
 }
 .tc-new-group-input::placeholder { color: #5a606c; }
+.tc-new-group-theme {
+    background: #171a21;
+    border: 1px solid #323845;
+    border-radius: 8px;
+    color: #e7e9ee;
+    padding: 8px 10px;
+    font-size: 12px;
+    outline: none;
+    resize: vertical;
+    font-family: inherit;
+    line-height: 1.4;
+}
+.tc-new-group-theme:focus { border-color: #4f6ef0; }
+.tc-new-group-theme::placeholder { color: #5a606c; }
 .tc-create-btn {
     padding: 8px 14px;
     border-radius: 8px;
@@ -1031,8 +1286,33 @@ pub const CSS: &str = r#"
     cursor: pointer;
     white-space: nowrap;
 }
-.tc-create-btn:hover { filter: brightness(1.06); }
-.tc-create-btn:active { transform: translateY(1px); }
+.tc-create-btn:hover:not(:disabled) { filter: brightness(1.06); }
+.tc-create-btn:active:not(:disabled) { transform: translateY(1px); }
+.tc-create-btn:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+
+/* ── Guided empty state ── */
+.tc-empty-guided {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 40px 20px;
+    color: #8a8f98;
+    text-align: center;
+}
+.tc-empty-guided p {
+    margin: 0;
+    line-height: 1.5;
+}
+.tc-create-guide {
+    margin-top: 8px;
+    padding: 10px 20px;
+    font-size: 13px;
+}
 
 /* ── Dissolve button ── */
 .tc-dissolve-btn {
@@ -1054,4 +1334,227 @@ pub const CSS: &str = r#"
     border-color: #e05a52;
     color: #e05a52;
 }
+
+/* ── Download progress / status ── */
+.tc-download-status {
+    text-align: center;
+    color: #8a8f98;
+    font-size: 10.5px;
+    margin-top: 4px;
+}
+
+/* ── Onboarding screen ── */
+.tc-onboarding {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 20px 16px 16px;
+    flex: 1;
+    overflow-y: auto;
+}
+.tc-onboarding-title {
+    font-weight: 700;
+    font-size: 16px;
+    color: #e7e9ee;
+    text-align: center;
+    margin-bottom: 6px;
+    letter-spacing: -0.2px;
+    line-height: 1.3;
+}
+.tc-onboarding-sub {
+    color: #8a8f98;
+    font-size: 12px;
+    text-align: center;
+    margin-bottom: 16px;
+    line-height: 1.4;
+}
+.tc-onboarding-grid {
+    display: grid;
+    grid-template-columns: repeat(3, 1fr);
+    gap: 8px;
+    width: 100%;
+    margin-bottom: 16px;
+}
+.tc-onboarding-card {
+    background: #21252e;
+    border: 1px solid #323845;
+    border-radius: 10px;
+    padding: 10px 8px;
+    cursor: pointer;
+    transition: border-color 0.15s, background 0.15s, transform 0.1s;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    user-select: none;
+    position: relative;
+    min-height: 62px;
+}
+.tc-onboarding-card:hover {
+    border-color: #4f6ef0;
+    background: #272c37;
+}
+.tc-onboarding-card:active {
+    transform: scale(0.97);
+}
+.tc-onboarding-card--selected {
+    border-color: #4f6ef0;
+    background: rgba(79, 110, 240, 0.08);
+}
+.tc-onboarding-card--selected:hover {
+    background: rgba(79, 110, 240, 0.12);
+}
+.tc-onboarding-card-name {
+    font-weight: 600;
+    font-size: 11.5px;
+    color: #e7e9ee;
+    line-height: 1.2;
+}
+.tc-onboarding-card-preview {
+    font-size: 10px;
+    color: #8a8f98;
+    line-height: 1.3;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+}
+.tc-onboarding-check {
+    position: absolute;
+    top: 6px;
+    right: 6px;
+    width: 16px;
+    height: 16px;
+    border-radius: 50%;
+    background: #4f6ef0;
+    color: #fff;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 10px;
+    font-weight: 700;
+    line-height: 1;
+}
+.tc-onboarding-commencer {
+    width: 100%;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 12px 16px;
+    border-radius: 10px;
+    border: none;
+    cursor: pointer;
+    background: linear-gradient(180deg, #6d8cff, #4f6ef0);
+    color: #fff;
+    font-weight: 600;
+    font-size: 14px;
+    letter-spacing: -0.1px;
+    box-shadow: 0 1px 0 rgba(255,255,255,.14) inset, 0 4px 14px rgba(79,110,240,.35);
+    margin-bottom: 10px;
+}
+.tc-onboarding-commencer:hover:not(:disabled) { filter: brightness(1.06); }
+.tc-onboarding-commencer:active:not(:disabled) { transform: translateY(1px); }
+.tc-onboarding-commencer:disabled {
+    opacity: 0.5;
+    cursor: default;
+}
+.tc-onboarding-passer {
+    background: none;
+    border: none;
+    color: #5a606c;
+    font-size: 11.5px;
+    cursor: pointer;
+    padding: 4px 8px;
+    border-radius: 6px;
+    transition: color 0.15s;
+}
+.tc-onboarding-passer:hover {
+    color: #8a8f98;
+}
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GroupState, StoredGroup};
+
+    #[test]
+    fn test_apply_create_groups_batch_empty() {
+        let mut state = GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let input: Vec<(String, String)> = vec![];
+        let added = apply_create_groups_batch(&mut state, &input, 1000.0);
+        assert_eq!(added, 0, "empty input must add zero groups");
+        assert!(state.groups.is_empty());
+    }
+
+    #[test]
+    fn test_apply_create_groups_batch_creates_multiple() {
+        let mut state = GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let input: Vec<(String, String)> = vec![
+            ("Dev".to_string(), "dev theme".to_string()),
+            ("Videos".to_string(), "video theme".to_string()),
+            ("Shopping".to_string(), "shop theme".to_string()),
+        ];
+        let added = apply_create_groups_batch(&mut state, &input, 1000.0);
+        assert_eq!(added, 3, "must create 3 groups");
+        assert_eq!(state.groups.len(), 3);
+        assert_eq!(state.groups[0].name, "Dev");
+        assert_eq!(state.groups[1].name, "Videos");
+        assert_eq!(state.groups[2].name, "Shopping");
+    }
+
+    #[test]
+    fn test_apply_create_groups_batch_idempotent() {
+        let mut state = GroupState {
+            version: 1,
+            groups: vec![StoredGroup {
+                name: "Dev".to_string(),
+                keywords: vec![],
+                created_at_ms: 500.0,
+                updated_at_ms: 500.0,
+                group_id: None,
+                display_name: None,
+                theme: "old theme".to_string(),
+                color: None,
+                manual: false,
+            }],
+        };
+        let input: Vec<(String, String)> = vec![
+            ("Dev".to_string(), "dev theme".to_string()),
+            ("Videos".to_string(), "video theme".to_string()),
+        ];
+        let added = apply_create_groups_batch(&mut state, &input, 1000.0);
+        assert_eq!(added, 1, "Dev is duplicate, only Videos must be added");
+        assert_eq!(state.groups.len(), 2);
+        // Existing group must NOT be mutated
+        assert_eq!(state.groups[0].theme, "old theme");
+        assert_eq!(state.groups[0].manual, false);
+    }
+
+    #[test]
+    fn test_apply_create_groups_batch_sets_manual_true() {
+        let mut state = GroupState {
+            version: 1,
+            groups: vec![],
+        };
+        let input: Vec<(String, String)> = vec![
+            ("Finance".to_string(), "money theme".to_string()),
+            ("Gaming".to_string(), "game theme".to_string()),
+        ];
+        let added = apply_create_groups_batch(&mut state, &input, 1000.0);
+        assert_eq!(added, 2);
+        for g in &state.groups {
+            assert!(g.manual, "group '{}' must have manual: true", g.name);
+            assert!(!g.theme.is_empty(), "group '{}' must have a theme", g.name);
+            assert_eq!(g.display_name.as_deref(), Some(g.name.as_str()));
+            assert!(!g.name.is_empty());
+        }
+    }
+}

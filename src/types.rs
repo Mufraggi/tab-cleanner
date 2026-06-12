@@ -32,9 +32,6 @@ pub struct GroupAssignment {
     pub tab_id: i32,
     /// Human-readable group label, e.g. "github.com", "YouTube", "Other"
     pub group_name: String,
-    /// The cleaned domain that was used for grouping, if any.
-    /// None for tabs without a valid URL (chrome://, empty, etc.).
-    pub domain: Option<String>,
     /// Key representative keywords extracted from the title.
     /// Empty if the title was missing or contained no useful words.
     pub keywords: Vec<String>,
@@ -89,6 +86,31 @@ pub struct QueryByGroupId {
 
 /// Storage key for the group state in chrome.storage.local.
 pub const GROUP_STATE_KEY: &str = "tab_cleanner_group_state";
+
+/// Storage key for the onboarding-done marker.
+/// Set to `true` after the user completes or skips the onboarding flow.
+pub const ONBOARDING_DONE_KEY: &str = "tab_cleanner_onboarding_done";
+
+/// The 12 onboarding themes presented as a grid of cards.
+/// Each tuple is (display name, theme description).
+///
+/// Thèmes courts (3-5 mots-clés forts) pour des ancres sémantiques denses.
+/// Les groupes DÉJÀ créés avec les anciens thèmes longs ne sont pas migrés ;
+/// il faut recréer ou éditer leurs thèmes pour profiter des nouvelles ancres.
+pub const ONBOARDING_THEMES: [(&str, &str); 12] = [
+    ("Dev / Tech", "développement code programmation github logiciel"),
+    ("Vidéos", "vidéos youtube streaming films séries"),
+    ("Réseaux sociaux", "réseaux sociaux linkedin twitter facebook instagram"),
+    ("Shopping", "achats shopping boutique e-commerce commande colis"),
+    ("Actualités", "actualités news presse journal article"),
+    ("Travail / Productivité", "travail productivité documents email projet"),
+    ("Apprentissage", "cours apprentissage formation tutoriel éducation"),
+    ("Voyage", "voyage vol hôtel réservation destination"),
+    ("Finance", "banque finance investissement bourse budget"),
+    ("Gaming", "jeux vidéo gaming esport guide"),
+    ("Santé / Bien-être", "santé bien-être sport fitness nutrition"),
+    ("Cuisine / Recettes", "cuisine recette gastronomie repas restaurant"),
+];
 
 #[cfg(test)]
 mod tests {
@@ -177,5 +199,34 @@ mod tests {
         }"#;
         let group: StoredGroup = serde_json::from_str(json).expect("deserialize");
         assert_eq!(group.color, None);
+    }
+
+    // ── Onboarding theme constant tests ──
+
+    #[test]
+    fn test_onboarding_themes_count() {
+        assert_eq!(ONBOARDING_THEMES.len(), 12);
+    }
+
+    #[test]
+    fn test_onboarding_themes_unique_names() {
+        let mut names: Vec<&str> = ONBOARDING_THEMES.iter().map(|(n, _)| *n).collect();
+        names.sort_unstable();
+        let orig_len = names.len();
+        names.dedup();
+        assert_eq!(names.len(), orig_len, "all 12 theme names must be unique");
+    }
+
+    #[test]
+    fn test_onboarding_themes_non_empty() {
+        for (i, (name, theme)) in ONBOARDING_THEMES.iter().enumerate() {
+            assert!(!name.is_empty(), "theme {} name must not be empty", i);
+            assert!(!theme.is_empty(), "theme {} description must not be empty", i);
+        }
+    }
+
+    #[test]
+    fn test_onboarding_done_key_value() {
+        assert_eq!(ONBOARDING_DONE_KEY, "tab_cleanner_onboarding_done");
     }
 }
