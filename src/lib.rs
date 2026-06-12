@@ -131,123 +131,31 @@ fn Popup() -> impl IntoView {
     });
 
     // Periodic re-check: poll every 5s until model is cached
-    {
-        let model_cached = model_cached.clone();
-        let onboarding_pending_sort = onboarding_pending_sort;
-        let data = data.clone();
-        let error_msg = error_msg.clone();
-        spawn_local(async move {
-            loop {
-                // Wait 5 seconds
-                let promise = js_sys::Promise::new(&mut |resolve, _| {
-                    if let Some(window) = web_sys::window() {
-                        let _ = window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                            &resolve, 5000,
-                        );
-                    }
-                });
-                let _ = wasm_bindgen_futures::JsFuture::from(promise).await;
-
-                if model_cached.get() {
-                    break;
-                }
-                match crate::popup::check_model_cached().await {
-                    Ok(true) => {
-                        model_cached.set(true);
-                        if onboarding_pending_sort.get_untracked() {
-                            onboarding_pending_sort.set(false);
-                            let data = data.clone();
-                            let error_msg = error_msg.clone();
-                            spawn_local(async move {
-                                if let Err(e) = crate::popup::trigger_semantic_grouping().await {
-                                    error_msg.set(Some(e));
-                                    return;
-                                }
-                                match crate::popup::fetch_popup_data().await {
-                                    Ok(pd) => data.set(Some(pd)),
-                                    Err(e) => error_msg.set(Some(e)),
-                                }
-                            });
-                        }
-                        break;
-                    }
-                    Ok(false) => { /* still not cached, continue polling */ }
-                    Err(e) => {
-                        oxichrome::log!("[popup] CheckModelCached poll failed: {}", e);
-                    }
-                }
-            }
-        });
-    }
+    crate::popup::handlers::spawn_model_polling(
+        model_cached,
+        onboarding_pending_sort,
+        data,
+        error_msg,
+    );
 
     // Shared refresh function (unused for now, but kept for future use)
-    let _refresh_data = {
-        let data = data;
-        let error_msg = error_msg;
-        move || {
-            let data = data.clone();
-            let error_msg = error_msg.clone();
-            spawn_local(async move {
-                match crate::popup::fetch_popup_data().await {
-                    Ok(pd) => {
-                        data.set(Some(pd));
-                        error_msg.set(None);
-                    }
-                    Err(e) => {
-                        error_msg.set(Some(e));
-                    }
-                }
-            });
-        }
+    let _refresh_data = move || {
+        crate::popup::handlers::handle_refresh_data(data, error_msg)
     };
 
     // Semantic grouping handler
-    let on_semantic = {
-        let data = data.clone();
-        let error_msg = error_msg.clone();
-        move |_| {
-            if is_semantic_ranking.get_untracked() {
-                return;
-            }
-            is_semantic_ranking.set(true);
-            let data = data.clone();
-            let error_msg = error_msg.clone();
-            spawn_local(async move {
-                match crate::popup::trigger_semantic_grouping().await {
-                    Ok(()) => {
-                        match crate::popup::fetch_popup_data().await {
-                            Ok(pd) => {
-                                data.set(Some(pd));
-                                error_msg.set(None);
-                            }
-                            Err(e) => {
-                                error_msg.set(Some(e));
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        error_msg.set(Some(e));
-                    }
-                }
-                is_semantic_ranking.set(false);
-            });
-        }
+    let on_semantic = move |_| {
+        crate::popup::handlers::handle_semantic_grouping(data, error_msg, is_semantic_ranking)
     };
 
     // Toggle expand
     let toggle_expand = move |name: String| {
-        let mut v = expanded.get();
-        if let Some(pos) = v.iter().position(|x| x == &name) {
-            v.remove(pos);
-        } else {
-            v.push(name);
-        }
-        expanded.set(v);
+        crate::popup::handlers::handle_toggle_expand(name, expanded)
     };
 
     // Check if a group is expanded
     let is_expanded = move |name: &str| -> bool {
-        expanded.with(|v| v.iter().any(|x| x == name))
+        crate::popup::handlers::handle_is_expanded(name, expanded)
     };
 
     // Rename state
@@ -255,195 +163,40 @@ fn Popup() -> impl IntoView {
     let draft_name: RwSignal<String> = RwSignal::new(String::new());
 
     let start_rename = move |name: String, current_display: String| {
-        editing_name.set(Some(name));
-        draft_name.set(current_display);
+        crate::popup::handlers::handle_start_rename(name, current_display, editing_name, draft_name)
     };
 
-    let commit_rename = {
-        let data = data;
-        let editing_name = editing_name;
-        let draft_name = draft_name;
-        move || {
-            if let Some(ref group_name) = editing_name.get_untracked() {
-                let new_name = draft_name.get_untracked().trim().to_string();
-                if !new_name.is_empty() {
-                    let group_name = group_name.clone();
-                    let new_name_clone = new_name.clone();
-                    let data = data.clone();
-
-                    // Optimistic UI update
-                    data.update(|opt| {
-                        if let Some(ref mut pd) = opt {
-                            if let Some(g) = pd.groups.iter_mut().find(|g| g.name == group_name) {
-                                g.display_name = new_name_clone;
-                            }
-                        }
-                    });
-
-                    wasm_bindgen_futures::spawn_local(async move {
-                        // 1. Persist directly to storage (no background worker needed)
-                        let persist = crate::popup::persist_group_fields(
-                            &group_name,
-                            Some(&new_name),
-                            None,
-                            None,
-                        ).await;
-
-                        // 2. Refresh UI from storage
-                        match crate::popup::fetch_popup_data().await {
-                            Ok(pd) => {
-                                data.set(Some(pd));
-                            }
-                            Err(e) => {
-                                oxichrome::log!("[popup] Refresh apres renommage echoue: {}", e);
-                            }
-                        }
-
-                        // 3. Best-effort: notify background to update Chrome native group
-                        if persist.is_ok() {
-                            crate::popup::send_update_group_best_effort(
-                                group_name,
-                                Some(new_name),
-                                None,
-                                None,
-                            ).await;
-                        }
-                    });
-                }
-            }
-            editing_name.set(None);
-        }
+    let commit_rename = move || {
+        crate::popup::handlers::handle_commit_rename(data, editing_name, draft_name)
     };
 
     let cancel_rename = move || {
-        editing_name.set(None);
+        crate::popup::handlers::handle_cancel_rename(editing_name)
     };
 
     // ── Colour change handler ──
-    let on_color_change = {
-        let data = data;
-        move |group_name: String, color_name: String| {
-            let hex = crate::popup::lookup_hex(&color_name).to_string();
-            let gn = group_name.clone();
-            let cn = color_name.clone();
-
-            // 1. Update local display immediately (optimistic)
-            data.update(|opt| {
-                if let Some(ref mut pd) = opt {
-                    if let Some(g) = pd.groups.iter_mut().find(|g| g.name == gn) {
-                        g.color_name = cn;
-                        g.color_hex = hex;
-                    }
-                }
-            });
-
-            let data = data.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                // 2. Persist directly to storage (no background worker needed)
-                let persist = crate::popup::persist_group_fields(
-                    &group_name,
-                    None,
-                    Some(&color_name),
-                    None,
-                ).await;
-
-                // 3. Refresh UI from storage
-                match crate::popup::fetch_popup_data().await {
-                    Ok(pd) => {
-                        data.set(Some(pd));
-                    }
-                    Err(e) => {
-                        oxichrome::log!("[popup] Refresh apres couleur echoue: {}", e);
-                    }
-                }
-
-                // 4. Best-effort: notify background to update Chrome native group
-                if persist.is_ok() {
-                    crate::popup::send_update_group_best_effort(
-                        group_name,
-                        None,
-                        Some(color_name),
-                        None,
-                    ).await;
-                }
-            });
-        }
+    let on_color_change = move |group_name: String, color_name: String| {
+        crate::popup::handlers::handle_color_change(group_name, color_name, data)
     };
 
     // ── New group creation handler ──
-    let on_create_group = {
-        let data = data.clone();
-        move || {
-            let name = new_group_name.get_untracked();
-            let theme = new_group_theme.get_untracked();
-            let trimmed_name = name.trim().to_string();
-            let trimmed_theme = theme.trim().to_string();
-            if trimmed_name.is_empty() || trimmed_theme.is_empty() {
-                return;
-            }
-            new_group_name.set(String::new());
-            new_group_theme.set(String::new());
-            show_new_group_input.set(false);
-            let data = data.clone();
-            spawn_local(async move {
-                let _ = crate::popup::persist_create_group(&trimmed_name, &trimmed_theme).await;
-                match crate::popup::fetch_popup_data().await {
-                    Ok(pd) => {
-                        data.set(Some(pd));
-                    }
-                    Err(e) => {
-                        oxichrome::log!("[popup] Refresh apres creation echoue: {}", e);
-                    }
-                }
-            });
-        }
+    let on_create_group = move || {
+        crate::popup::handlers::handle_create_group(
+            data,
+            new_group_name,
+            new_group_theme,
+            show_new_group_input,
+        )
     };
 
     // ── Dissolve group handler ──
-    let on_dissolve_group = {
-        let data = data.clone();
-        move |name: String| {
-            let data = data.clone();
-            spawn_local(async move {
-                crate::popup::send_dissolve_group_best_effort(name).await;
-                match crate::popup::fetch_popup_data().await {
-                    Ok(pd) => {
-                        data.set(Some(pd));
-                    }
-                    Err(e) => {
-                        oxichrome::log!("[popup] Refresh apres dissolution echoue: {}", e);
-                    }
-                }
-            });
-        }
+    let on_dissolve_group = move |name: String| {
+        crate::popup::handlers::handle_dissolve_group(name, data)
     };
 
     // ── Theme change handler ──
-    let on_theme_change = {
-        let data = data;
-        move |group_name: String, theme_value: String| {
-            let data = data.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                // 1. Persist directly to storage ONLY (theme has no Chrome API effect)
-                let _ = crate::popup::persist_group_fields(
-                    &group_name,
-                    None,
-                    None,
-                    Some(&theme_value),
-                ).await;
-
-                // 2. Refresh UI from storage
-                match crate::popup::fetch_popup_data().await {
-                    Ok(pd) => {
-                        data.set(Some(pd));
-                    }
-                    Err(e) => {
-                        oxichrome::log!("[popup] Refresh apres theme echoue: {}", e);
-                    }
-                }
-                // NO background call — theme is storage-only
-            });
-        }
+    let on_theme_change = move |group_name: String, theme_value: String| {
+        crate::popup::handlers::handle_theme_change(group_name, theme_value, data)
     };
 
     // ── Render ──
@@ -467,56 +220,17 @@ fn Popup() -> impl IntoView {
             {move || if show_onboarding.get() {
                 crate::popup::render_onboarding(
                     onboarding_selected,
-                    {
-                        let data = data.clone();
-                        let error_msg = error_msg.clone();
-                        let onboarding_pending_sort = onboarding_pending_sort;
-                        let show_onboarding = show_onboarding;
-                        move || {
-                            let selected: Vec<(String, String)> = onboarding_selected
-                                .get()
-                                .iter()
-                                .map(|&i| {
-                                    let (name, theme) = crate::types::ONBOARDING_THEMES[i];
-                                    (name.to_string(), theme.to_string())
-                                })
-                                .collect();
-                            let data = data.clone();
-                            let error_msg = error_msg.clone();
-                            spawn_local(async move {
-                                if let Err(e) = crate::popup::persist_create_groups_batch(&selected).await {
-                                    error_msg.set(Some(e));
-                                    return;
-                                }
-                                crate::popup::set_onboarding_done().await;
-                                let cached = crate::popup::check_model_cached().await.unwrap_or(false);
-                                if cached {
-                                    if let Err(e) = crate::popup::trigger_semantic_grouping().await {
-                                        error_msg.set(Some(e));
-                                    }
-                                    match crate::popup::fetch_popup_data().await {
-                                        Ok(pd) => data.set(Some(pd)),
-                                        Err(e) => error_msg.set(Some(e)),
-                                    }
-                                } else {
-                                    onboarding_pending_sort.set(true);
-                                    match crate::popup::fetch_popup_data().await {
-                                        Ok(pd) => data.set(Some(pd)),
-                                        Err(e) => error_msg.set(Some(e)),
-                                    }
-                                }
-                                show_onboarding.set(false);
-                            });
-                        }
+                    move || {
+                        crate::popup::handlers::handle_onboarding_commencer(
+                            onboarding_selected,
+                            data,
+                            error_msg,
+                            onboarding_pending_sort,
+                            show_onboarding,
+                        )
                     },
-                    {
-                        let show_onboarding = show_onboarding;
-                        move || {
-                            spawn_local(async move {
-                                crate::popup::set_onboarding_done().await;
-                                show_onboarding.set(false);
-                            });
-                        }
+                    move || {
+                        crate::popup::handlers::handle_onboarding_passer(show_onboarding)
                     },
                 ).into_any()
             } else {
@@ -578,37 +292,14 @@ fn Popup() -> impl IntoView {
                     {move || if show_new_group_input.get() {
                         let name_val = new_group_name.get();
                         let theme_val = new_group_theme.get();
-                        let on_name_input = move |ev: leptos::ev::Event| {
-                            if let Some(target) = ev.target() {
-                                if let Ok(v) = js_sys::Reflect::get(
-                                    &target,
-                                    &wasm_bindgen::JsValue::from_str("value"),
-                                ) {
-                                    if let Some(s) = v.as_string() {
-                                        new_group_name.set(s);
-                                    }
-                                }
-                            }
-                        };
-                        let on_theme_input = move |ev: leptos::ev::Event| {
-                            if let Some(target) = ev.target() {
-                                if let Ok(v) = js_sys::Reflect::get(
-                                    &target,
-                                    &wasm_bindgen::JsValue::from_str("value"),
-                                ) {
-                                    if let Some(s) = v.as_string() {
-                                        new_group_theme.set(s);
-                                    }
-                                }
-                            }
-                        };
-                        let on_key = move |ev: leptos::ev::KeyboardEvent| {
-                            if ev.key() == "Escape" {
-                                show_new_group_input.set(false);
-                                new_group_name.set(String::new());
-                                new_group_theme.set(String::new());
-                            }
-                        };
+                        let on_name_input = crate::popup::handlers::make_on_name_input(new_group_name);
+                        let on_theme_input = crate::popup::handlers::make_on_theme_input(new_group_theme);
+                        let on_key1 = crate::popup::handlers::make_on_new_group_key(
+                            new_group_name,
+                            new_group_theme,
+                            show_new_group_input,
+                        );
+                        let on_key2 = on_key1.clone();
                         let on_create_click = on_create_group.clone();
                         let name_empty = move || new_group_name.get().trim().is_empty();
                         let theme_empty = move || new_group_theme.get().trim().is_empty();
@@ -619,7 +310,7 @@ fn Popup() -> impl IntoView {
                                     class="tc-new-group-input"
                                     prop:value={name_val}
                                     on:input=on_name_input
-                                    on:keydown=on_key
+                                    on:keydown=on_key1
                                     autofocus=true
                                     placeholder="Nom du groupe..."
                                 />
@@ -627,7 +318,7 @@ fn Popup() -> impl IntoView {
                                     class="tc-new-group-theme"
                                     prop:value={theme_val}
                                     on:input=on_theme_input
-                                    on:keydown=on_key
+                                    on:keydown=on_key2
                                     placeholder="Decris ce que ce groupe doit contenir — le tri rangera les onglets pertinents ici."
                                     rows="2"
                                 ></textarea>
