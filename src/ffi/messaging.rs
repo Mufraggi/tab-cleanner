@@ -9,12 +9,6 @@ extern "C" {
     fn add_on_message_listener(callback: &JsValue);
 }
 
-/// HuggingFace CDN URLs for the sentence-transformers model.
-const MODEL_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors";
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
-
 /// Commands the popup can send to the background service worker.
 ///
 /// Each variant is dispatched via `serde_wasm_bindgen` using the `"type"` tag
@@ -144,17 +138,11 @@ pub fn apply_create_group(state: &mut crate::types::GroupState, name: &str, them
     if state.groups.iter().any(|g| g.name == name) {
         return false; // already exists — idempotent
     }
-    state.groups.push(crate::types::StoredGroup {
-        name: name.to_string(),
-        keywords: vec![],
-        created_at_ms: now_ms,
-        updated_at_ms: now_ms,
-        group_id: None,
-        display_name: Some(name.to_string()),
-        theme: theme.unwrap_or("").to_string(),
-        color: None,
-        manual: true,
-    });
+    state.groups.push(crate::types::StoredGroup::new_manual(
+        name.to_string(),
+        theme.unwrap_or("").to_string(),
+        now_ms,
+    ));
     true
 }
 
@@ -224,9 +212,9 @@ async fn handle_dissolve_group(name: String) -> Result<(), String> {
 ///
 /// Returns `Ok("downloaded")` when both files are cached (either from cache or network).
 async fn handle_download_model() -> Result<String, String> {
-    let src1 = crate::sml::ensure_model_cached(MODEL_URL).await
+    let src1 = crate::sml::ensure_model_cached(crate::types::MODEL_URL).await
         .map_err(|e| format!("Echec du telechargement du modele : {}", e))?;
-    let src2 = crate::sml::ensure_model_cached(TOKENIZER_URL).await
+    let src2 = crate::sml::ensure_model_cached(crate::types::TOKENIZER_URL).await
         .map_err(|e| format!("Echec du telechargement du tokenizer : {}", e))?;
     oxichrome::log!(
         "[messaging] Model cache: {} (model), {} (tokenizer)",
@@ -240,9 +228,34 @@ async fn handle_download_model() -> Result<String, String> {
 ///
 /// This is a lightweight operation — it only performs `cache.match()`, not actual loading.
 async fn is_model_cached() -> bool {
-    let model_ok = crate::sml::model_cache::is_url_cached(MODEL_URL).await;
-    let tokenizer_ok = crate::sml::model_cache::is_url_cached(TOKENIZER_URL).await;
+    let model_ok = crate::sml::model_cache::is_url_cached(crate::types::MODEL_URL).await;
+    let tokenizer_ok = crate::sml::model_cache::is_url_cached(crate::types::TOKENIZER_URL).await;
     model_ok && tokenizer_ok
+}
+
+/// Helper: serialise a handler result into a `MessagingResponse` and send it back
+/// to the popup via `send_fn.call1`.
+///
+/// - `Ok(data)` → `MessagingResponse { success: true, data }`
+/// - `Err(e)`  → `MessagingResponse { success: false, data: Some(e) }`
+///
+/// Serialisation errors are logged but never panic the service worker.
+fn reply(send_fn: &js_sys::Function, result: Result<Option<String>, String>) {
+    let (success, data) = match result {
+        Ok(data) => (true, data),
+        Err(e) => (false, Some(e)),
+    };
+    match serde_wasm_bindgen::to_value(&MessagingResponse { success, data }) {
+        Ok(val) => {
+            let _ = send_fn.call1(&JsValue::NULL, &val);
+        }
+        Err(e) => {
+            oxichrome::log!(
+                "[messaging] Response serialisation error: {:?}",
+                e
+            );
+        }
+    }
 }
 
 /// Register the `chrome.runtime.onMessage` listener for popup ↔ background communication.
@@ -280,20 +293,7 @@ pub fn register_message_listener() {
                         .and_then(|val| JSON::stringify(&val).ok())
                         .and_then(|s| s.as_string());
 
-                    match serde_wasm_bindgen::to_value(&MessagingResponse {
-                        success: true,
-                        data: state_json,
-                    }) {
-                        Ok(val) => {
-                            let _ = send_fn.call1(&JsValue::NULL, &val);
-                        }
-                        Err(e) => {
-                            oxichrome::log!(
-                                "[messaging] GetState response serialisation error: {:?}",
-                                e
-                            );
-                        }
-                    }
+                    reply(&send_fn, Ok(state_json));
                 });
             }
 
@@ -305,200 +305,48 @@ pub fn register_message_listener() {
             }) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match handle_update_group(name, display_name, color, theme).await {
-                        Ok(()) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: true,
-                                data: None,
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e) => {
-                                    oxichrome::log!(
-                                        "[messaging] UpdateGroup response serialisation error: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: false,
-                                data: Some(e),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e2) => {
-                                    oxichrome::log!(
-                                        "[messaging] UpdateGroup error response serialisation error: {:?}",
-                                        e2
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let result = handle_update_group(name, display_name, color, theme)
+                        .await
+                        .map(|()| None);
+                    reply(&send_fn, result);
                 });
             }
 
             Ok(PopupCommand::CreateGroup { name, theme }) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match handle_create_group(name, theme).await {
-                        Ok(()) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: true,
-                                data: None,
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e) => {
-                                    oxichrome::log!(
-                                        "[messaging] CreateGroup response serialisation error: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: false,
-                                data: Some(e),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e2) => {
-                                    oxichrome::log!(
-                                        "[messaging] CreateGroup error response serialisation error: {:?}",
-                                        e2
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let result = handle_create_group(name, theme)
+                        .await
+                        .map(|()| None);
+                    reply(&send_fn, result);
                 });
             }
 
             Ok(PopupCommand::DissolveGroup { name }) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match handle_dissolve_group(name).await {
-                        Ok(()) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: true,
-                                data: None,
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e) => {
-                                    oxichrome::log!(
-                                        "[messaging] DissolveGroup response serialisation error: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: false,
-                                data: Some(e),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e2) => {
-                                    oxichrome::log!(
-                                        "[messaging] DissolveGroup error response serialisation error: {:?}",
-                                        e2
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let result = handle_dissolve_group(name)
+                        .await
+                        .map(|()| None);
+                    reply(&send_fn, result);
                 });
             }
 
             Ok(PopupCommand::RunSemanticGrouping) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match crate::semantic::run_semantic_grouping().await {
-                        Ok(_) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: true,
-                                data: None,
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e) => {
-                                    oxichrome::log!(
-                                        "[messaging] RunSemanticGrouping response serialisation error: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: false,
-                                data: Some(e),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e2) => {
-                                    oxichrome::log!(
-                                        "[messaging] RunSemanticGrouping error serialisation error: {:?}",
-                                        e2
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let result = crate::semantic::run_semantic_grouping()
+                        .await
+                        .map(|_| None);
+                    reply(&send_fn, result);
                 });
             }
 
             Ok(PopupCommand::DownloadModel) => {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
-                    match handle_download_model().await {
-                        Ok(msg) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: true,
-                                data: Some(msg),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e) => {
-                                    oxichrome::log!(
-                                        "[messaging] DownloadModel response serialisation error: {:?}",
-                                        e
-                                    );
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            match serde_wasm_bindgen::to_value(&MessagingResponse {
-                                success: false,
-                                data: Some(e),
-                            }) {
-                                Ok(val) => {
-                                    let _ = send_fn.call1(&JsValue::NULL, &val);
-                                }
-                                Err(e2) => {
-                                    oxichrome::log!(
-                                        "[messaging] DownloadModel error serialisation error: {:?}",
-                                        e2
-                                    );
-                                }
-                            }
-                        }
-                    }
+                    let result = handle_download_model().await.map(Some);
+                    reply(&send_fn, result);
                 });
             }
 
@@ -506,20 +354,10 @@ pub fn register_message_listener() {
                 let send_fn = send_fn.clone();
                 wasm_bindgen_futures::spawn_local(async move {
                     let cached = is_model_cached().await;
-                    match serde_wasm_bindgen::to_value(&MessagingResponse {
-                        success: true,
-                        data: Some(if cached { "true" } else { "false" }.to_string()),
-                    }) {
-                        Ok(val) => {
-                            let _ = send_fn.call1(&JsValue::NULL, &val);
-                        }
-                        Err(e) => {
-                            oxichrome::log!(
-                                "[messaging] CheckModelCached response serialisation error: {:?}",
-                                e
-                            );
-                        }
-                    }
+                    // Backward-compatible: encode bool as "true"/"false" string.
+                    // The popup side (check_model_cached) expects these exact strings.
+                    let data = Some(if cached { "true" } else { "false" }.to_string());
+                    reply(&send_fn, Ok(data));
                 });
             }
 
@@ -528,21 +366,7 @@ pub fn register_message_listener() {
                     "[messaging] Failed to parse PopupCommand: {:?}",
                     e
                 );
-
-                match serde_wasm_bindgen::to_value(&MessagingResponse {
-                    success: false,
-                    data: Some(format!("Parse error: {:?}", e)),
-                }) {
-                    Ok(val) => {
-                        let _ = send_fn.call1(&JsValue::NULL, &val);
-                    }
-                    Err(e2) => {
-                        oxichrome::log!(
-                            "[messaging] Failed to serialise error response: {:?}",
-                            e2
-                        );
-                    }
-                }
+                reply(&send_fn, Err(format!("Parse error: {:?}", e)));
             }
         }
 

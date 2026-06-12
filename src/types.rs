@@ -69,6 +69,27 @@ pub struct StoredGroup {
     pub manual: bool,
 }
 
+impl StoredGroup {
+    /// Construct a new manual group with default values.
+    ///
+    /// Sets `display_name = Some(name)`, `manual = true`, and all other
+    /// fields to their natural defaults. Centralises the construction pattern
+    /// that was previously duplicated at 4 call sites.
+    pub fn new_manual(name: String, theme: String, now_ms: f64) -> Self {
+        StoredGroup {
+            name: name.clone(),
+            keywords: vec![],
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            group_id: None,
+            display_name: Some(name),
+            theme,
+            color: None,
+            manual: true,
+        }
+    }
+}
+
 /// Top-level persistence payload stored under GROUP_STATE_KEY.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GroupState {
@@ -83,6 +104,14 @@ pub struct GroupState {
 pub struct QueryByGroupId {
     pub group_id: i32,
 }
+
+// ── HuggingFace CDN URLs for the sentence-transformers model ──
+/// URL for the all-MiniLM-L6-v2 model weights (safetensors f16).
+pub const MODEL_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors";
+/// URL for the all-MiniLM-L6-v2 tokenizer vocabulary (tokenizer.json).
+pub const TOKENIZER_URL: &str =
+    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
 
 /// Storage key for the group state in chrome.storage.local.
 pub const GROUP_STATE_KEY: &str = "tab_cleanner_group_state";

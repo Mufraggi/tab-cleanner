@@ -19,22 +19,16 @@ use crate::popup::{CSS, PopupData};
 )]
 struct Extension;
 
-// ── HuggingFace CDN URLs for the sentence-transformers model ──
-const MODEL_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors";
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
-
 /// Fire-and-forget background download of model + tokenizer.
 /// Idempotent: does nothing if files are already cached.
 /// Errors are logged but never surface to the user.
 fn spawn_background_download(log_tag: &'static str) {
     wasm_bindgen_futures::spawn_local(async move {
-        match crate::sml::ensure_model_cached(MODEL_URL).await {
+        match crate::sml::ensure_model_cached(crate::types::MODEL_URL).await {
             Ok(src) => oxichrome::log!("[{}] Model cache: {}", log_tag, src),
             Err(e) => oxichrome::log!("[{}] Model download failed (best-effort): {}", log_tag, e),
         }
-        match crate::sml::ensure_model_cached(TOKENIZER_URL).await {
+        match crate::sml::ensure_model_cached(crate::types::TOKENIZER_URL).await {
             Ok(src) => oxichrome::log!("[{}] Tokenizer cache: {}", log_tag, src),
             Err(e) => oxichrome::log!("[{}] Tokenizer download failed (best-effort): {}", log_tag, e),
         }

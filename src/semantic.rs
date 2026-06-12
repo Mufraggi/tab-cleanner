@@ -22,12 +22,6 @@ use crate::sml::model_cache::load_weights_from_cache;
 use crate::sml::model_loader::{embed_cached, load_model_from_bytes};
 use crate::types::{GroupAssignment, QueryAllTabs, TabInfo};
 
-/// HuggingFace CDN URLs for the sentence-transformers model.
-const MODEL_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/model.safetensors";
-const TOKENIZER_URL: &str =
-    "https://huggingface.co/sentence-transformers/all-MiniLM-L6-v2/resolve/main/tokenizer.json";
-
 /// Embedding dimension for all-MiniLM-L6-v2.
 const EMBEDDING_DIM: usize = 384;
 
@@ -56,6 +50,64 @@ fn extract_domain(url_text: &str) -> String {
     }
 }
 
+/// Pure logic: build `GroupAssignment`s from pre-computed embeddings.
+///
+/// Takes tab embeddings, stored groups, theme embeddings, tab info and the tab→embedding
+/// lookup map as input, and produces a list of group assignments WITHOUT any I/O.
+///
+/// Steps 9-11 of the semantic pipeline:
+/// 9. Compute group anchors (theme embedding or centroid of tabs in the group)
+/// 10. Assign tabs semantically via `assign_tabs_semantic`
+/// 11. Map results to `GroupAssignment` — unassigned tabs get `group_name = "Other"`
+///
+/// This function is pure and testable with synthetic embeddings.
+fn build_semantic_assignments(
+    tab_embeddings: &[(TabId, Vec<f32>)],
+    stored_groups: &[crate::types::StoredGroup],
+    theme_embedding_map: &HashMap<String, Vec<f32>>,
+    tabs: &[TabInfo],
+    tab_emb_map: &HashMap<TabId, Vec<f32>>,
+) -> Vec<GroupAssignment> {
+    // ── 9. Compute group anchors ─────────────────────────────────────────
+    let mut anchors: Vec<(String, Vec<f32>)> = Vec::new();
+    for group in stored_groups {
+        let theme_emb = theme_embedding_map.get(&group.name);
+
+        let group_tab_embs: Vec<Vec<f32>> = tabs
+            .iter()
+            .filter(|tab| {
+                group.group_id.map_or(false, |gid| tab.group_id == gid)
+            })
+            .filter_map(|tab| tab_emb_map.get(&tab.id).cloned())
+            .collect();
+
+        let anchor = group_anchor(group, &group_tab_embs, theme_emb);
+        if let Some(a) = anchor {
+            anchors.push((group.name.clone(), a));
+        }
+    }
+
+    // ── 10. Assign tabs semantically ─────────────────────────────────────
+    let semantic_assignments = assign_tabs_semantic(tab_embeddings, &anchors, SIMILARITY_THRESHOLD);
+
+    // ── 11. Build GroupAssignments: SML-assigned + unassigned → "Other" ──
+    let mut all_assignments: Vec<GroupAssignment> = Vec::with_capacity(tab_embeddings.len());
+
+    for sa in &semantic_assignments {
+        let group_name = sa
+            .assigned_group
+            .clone()
+            .unwrap_or_else(|| "Other".to_string());
+        all_assignments.push(GroupAssignment {
+            tab_id: sa.tab_id,
+            group_name,
+            keywords: vec![],
+        });
+    }
+
+    all_assignments
+}
+
 /// Run the full semantic grouping pipeline.
 ///
 /// # Returns
@@ -70,7 +122,7 @@ fn extract_domain(url_text: &str) -> String {
 /// - Chrome API (tabs.query, tabGroups) fails
 pub async fn run_semantic_grouping() -> Result<(), String> {
     // ── 1. Load model from cache ─────────────────────────────────────────
-    let model_bytes = load_weights_from_cache(MODEL_URL)
+    let model_bytes = load_weights_from_cache(crate::types::MODEL_URL)
         .await
         .map_err(|e| format!(
             "Modele non telecharge. Cliquez 'Telecharger le modele' d'abord.\nDetail: {}",
@@ -80,7 +132,7 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
         .map_err(|e| format!("Echec du chargement du modele : {}", e))?;
 
     // ── 2. Load tokenizer from cache ─────────────────────────────────────
-    let tokenizer_bytes = load_weights_from_cache(TOKENIZER_URL)
+    let tokenizer_bytes = load_weights_from_cache(crate::types::TOKENIZER_URL)
         .await
         .map_err(|e| format!(
             "Tokenizer non telecharge. Cliquez 'Telecharger le modele' d'abord.\nDetail: {}",
@@ -180,53 +232,14 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
         .map(|(id, emb)| (*id, emb.clone()))
         .collect();
 
-    // ── 9. Compute group anchors ─────────────────────────────────────────
-    // For each StoredGroup:
-    //   - If theme is non-empty and we have its embedding → use it
-    //   - Else, collect embeddings of tabs currently IN the group → compute centroid
-    //   - Else → no anchor (skip)
-    let mut anchors: Vec<(String, Vec<f32>)> = Vec::new();
-    for group in &stored.groups {
-        let theme_emb = theme_embedding_map.get(&group.name);
-
-        // Collect embeddings of tabs currently in this Chrome group
-        let group_tab_embs: Vec<Vec<f32>> = tabs
-            .iter()
-            .filter(|tab| {
-                // A tab belongs to this stored group if:
-                // - stored.group_id is Some(id) AND tab.group_id == id
-                group.group_id.map_or(false, |gid| tab.group_id == gid)
-            })
-            .filter_map(|tab| tab_emb_map.get(&tab.id).cloned())
-            .collect();
-
-        let anchor = group_anchor(group, &group_tab_embs, theme_emb);
-        if let Some(a) = anchor {
-            anchors.push((group.name.clone(), a));
-        }
-    }
-
-    // ── 10. Assign tabs semantically ─────────────────────────────────────
-    let semantic_assignments = assign_tabs_semantic(&tab_embeddings, &anchors, SIMILARITY_THRESHOLD);
-
-    // ── 11. Build GroupAssignments: SML-assigned + unassigned → "Other" ──
-    let mut all_assignments: Vec<GroupAssignment> = Vec::with_capacity(tabs.len());
-    let mut sml_count = 0usize;
-
-    for sa in &semantic_assignments {
-        let group_name = sa
-            .assigned_group
-            .clone()
-            .unwrap_or_else(|| "Other".to_string());
-        if sa.assigned_group.is_some() {
-            sml_count += 1;
-        }
-        all_assignments.push(GroupAssignment {
-            tab_id: sa.tab_id,
-            group_name,
-            keywords: vec![],
-        });
-    }
+    // ── 9-11. Pure: compute anchors, assign tabs, build GroupAssignments ─
+    let all_assignments = build_semantic_assignments(
+        &tab_embeddings,
+        &stored.groups,
+        &theme_embedding_map,
+        &tabs,
+        &tab_emb_map,
+    );
 
     // ── 12. Reconcile, apply, persist ────────────────────────────────────
     let now_ms = js_sys::Date::now();
@@ -240,6 +253,10 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
         .iter()
         .map(|a| a.group_name.as_str())
         .collect();
+    let sml_count = all_assignments
+        .iter()
+        .filter(|a| a.group_name != "Other")
+        .count();
     oxichrome::log!(
         "Semantic grouping complete: {} tabs → {} groups ({} SML, {} unassigned, {} persisted total)",
         all_assignments.len(),
@@ -259,7 +276,7 @@ mod tests {
     use super::*;
     use crate::sml::grouping::{
         cosine_similarity, compute_centroid, group_anchor, assign_tab, assign_tabs_semantic,
-        SemanticAssignment, SIMILARITY_THRESHOLD,
+        SIMILARITY_THRESHOLD,
     };
     use crate::types::StoredGroup;
 
@@ -417,5 +434,134 @@ mod tests {
     #[test]
     fn test_similarity_threshold_value() {
         assert!((SIMILARITY_THRESHOLD - 0.25).abs() < 1e-6);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════
+    // build_semantic_assignments (pure function) tests
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /// Test: a tab with embedding close to a group's theme → assigned to that group,
+    /// a tab far from all → "Other".
+    #[test]
+    fn test_build_assignments_theme_anchor_assigns_close_tab() {
+        let group = make_stored_group("dev", "coding", None, false);
+        let tab_embeddings = vec![
+            (1i32, v1()), // close to dev theme (v1)
+            (2i32, v4()), // opposite → far from dev
+        ];
+        let mut theme_emb_map = HashMap::new();
+        theme_emb_map.insert("dev".to_string(), v1());
+        let tabs: Vec<TabInfo> = vec![]; // no tabs currently in Chrome groups
+        let tab_emb_map: HashMap<TabId, Vec<f32>> = tab_embeddings
+            .iter()
+            .map(|(id, emb)| (*id, emb.clone()))
+            .collect();
+
+        let assignments = build_semantic_assignments(
+            &tab_embeddings,
+            &[group],
+            &theme_emb_map,
+            &tabs,
+            &tab_emb_map,
+        );
+        assert_eq!(assignments.len(), 2);
+        assert_eq!(assignments[0].tab_id, 1);
+        assert_eq!(assignments[0].group_name, "dev");
+        assert_eq!(assignments[1].tab_id, 2);
+        assert_eq!(assignments[1].group_name, "Other");
+    }
+
+    /// Test: no stored groups → all tabs assigned to "Other".
+    #[test]
+    fn test_build_assignments_no_groups_all_other() {
+        let tab_embeddings = vec![
+            (10i32, v1()),
+            (20i32, v3()),
+        ];
+        let theme_emb_map: HashMap<String, Vec<f32>> = HashMap::new();
+        let tabs: Vec<TabInfo> = vec![];
+        let tab_emb_map: HashMap<TabId, Vec<f32>> = tab_embeddings
+            .iter()
+            .map(|(id, emb)| (*id, emb.clone()))
+            .collect();
+
+        let assignments = build_semantic_assignments(
+            &tab_embeddings,
+            &[],
+            &theme_emb_map,
+            &tabs,
+            &tab_emb_map,
+        );
+        assert_eq!(assignments.len(), 2);
+        for a in &assignments {
+            assert_eq!(a.group_name, "Other");
+        }
+    }
+
+    /// Test: empty input → empty output.
+    #[test]
+    fn test_build_assignments_empty_yields_empty() {
+        let assignments = build_semantic_assignments(
+            &[],
+            &[],
+            &HashMap::new(),
+            &[],
+            &HashMap::new(),
+        );
+        assert!(assignments.is_empty());
+    }
+
+    /// Test: group with tabs in a Chrome group but no theme → centroid fallback used.
+    #[test]
+    fn test_build_assignments_centroid_fallback() {
+        let group = make_stored_group("g1", "", Some(1), false);
+        let tab_embeddings = vec![
+            (100i32, v1()), // centroid of [v1, v6] ≈ [0.894, 0.447, 0] → cos 0.894 with v1
+        ];
+        // Two tabs already in the Chrome group (group_id=1)
+        let tabs = vec![
+            TabInfo { id: 101, url: None, title: None, group_id: 1 },
+            TabInfo { id: 102, url: None, title: None, group_id: 1 },
+        ];
+        // Their embeddings → centroid fallback
+        let mut tab_emb_map = HashMap::new();
+        tab_emb_map.insert(101i32, v4()); // v4 = [-1, 0, 0]
+        tab_emb_map.insert(102i32, v3()); // v3 = [0, 1, 0]
+        // centroid of [v4, v3] = normalize([-1, 1, 0]) = [-0.707, 0.707, 0]
+        // cos(v1, centroid) = 1*-0.707 + 0*0.707 + 0*0 = -0.707 < threshold
+
+        let theme_emb_map: HashMap<String, Vec<f32>> = HashMap::new();
+
+        let assignments = build_semantic_assignments(
+            &tab_embeddings,
+            &[group],
+            &theme_emb_map,
+            &tabs,
+            &tab_emb_map,
+        );
+        assert_eq!(assignments.len(), 1);
+        // Tab 100 (v1) should be "Other" — its cos with centroid (-0.707) is below threshold
+        assert_eq!(assignments[0].group_name, "Other");
+    }
+
+    /// Test: assignment keys must be empty.
+    #[test]
+    fn test_build_assignments_no_keywords() {
+        let group = make_stored_group("docs", "documentation", None, false);
+        let tab_embeddings = vec![(5i32, v1())];
+        let mut theme_emb_map = HashMap::new();
+        theme_emb_map.insert("docs".to_string(), v1());
+        let tabs: Vec<TabInfo> = vec![];
+        let tab_emb_map: HashMap<TabId, Vec<f32>> = HashMap::new();
+
+        let assignments = build_semantic_assignments(
+            &tab_embeddings,
+            &[group],
+            &theme_emb_map,
+            &tabs,
+            &tab_emb_map,
+        );
+        assert_eq!(assignments.len(), 1);
+        assert!(assignments[0].keywords.is_empty(), "keywords must be empty (semantic grouping does not extract keywords)");
     }
 }
