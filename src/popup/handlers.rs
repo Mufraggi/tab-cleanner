@@ -68,7 +68,7 @@ pub fn handle_commit_rename(
                         data.set(Some(pd));
                     }
                     Err(e) => {
-                        oxichrome::log!("[popup] Refresh apres renommage echoue: {}", e);
+                        oxichrome::log!("[popup] Refresh after rename failed: {}", e);
                     }
                 }
 
@@ -130,7 +130,7 @@ pub fn handle_color_change(
                 data.set(Some(pd));
             }
             Err(e) => {
-                oxichrome::log!("[popup] Refresh apres couleur echoue: {}", e);
+                oxichrome::log!("[popup] Refresh after color failed: {}", e);
             }
         }
 
@@ -173,7 +173,7 @@ pub fn handle_create_group(
                 data.set(Some(pd));
             }
             Err(e) => {
-                oxichrome::log!("[popup] Refresh apres creation echoue: {}", e);
+                oxichrome::log!("[popup] Refresh after creation failed: {}", e);
             }
         }
     });
@@ -190,7 +190,7 @@ pub fn handle_dissolve_group(name: String, data: RwSignal<Option<PopupData>>) {
                 data.set(Some(pd));
             }
             Err(e) => {
-                oxichrome::log!("[popup] Refresh apres dissolution echoue: {}", e);
+                oxichrome::log!("[popup] Refresh after dissolve failed: {}", e);
             }
         }
     });
@@ -215,7 +215,7 @@ pub fn handle_theme_change(
                 data.set(Some(pd));
             }
             Err(e) => {
-                oxichrome::log!("[popup] Refresh apres theme echoue: {}", e);
+                oxichrome::log!("[popup] Refresh after theme failed: {}", e);
             }
         }
         // NO background call — theme is storage-only

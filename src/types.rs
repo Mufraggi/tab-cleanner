@@ -123,22 +123,22 @@ pub const ONBOARDING_DONE_KEY: &str = "tab_cleanner_onboarding_done";
 /// The 12 onboarding themes presented as a grid of cards.
 /// Each tuple is (display name, theme description).
 ///
-/// Thèmes courts (3-5 mots-clés forts) pour des ancres sémantiques denses.
-/// Les groupes DÉJÀ créés avec les anciens thèmes longs ne sont pas migrés ;
-/// il faut recréer ou éditer leurs thèmes pour profiter des nouvelles ancres.
+/// Short, dense themes (3-5 strong keywords) for semantic anchors.
+/// Groups ALREADY created with old long themes are NOT migrated;
+/// recreate or edit their themes to benefit from the new anchors.
 pub const ONBOARDING_THEMES: [(&str, &str); 12] = [
-    ("Dev / Tech", "développement code programmation github logiciel"),
-    ("Vidéos", "vidéos youtube streaming films séries"),
-    ("Réseaux sociaux", "réseaux sociaux linkedin twitter facebook instagram"),
-    ("Shopping", "achats shopping boutique e-commerce commande colis"),
-    ("Actualités", "actualités news presse journal article"),
-    ("Travail / Productivité", "travail productivité documents email projet"),
-    ("Apprentissage", "cours apprentissage formation tutoriel éducation"),
-    ("Voyage", "voyage vol hôtel réservation destination"),
-    ("Finance", "banque finance investissement bourse budget"),
-    ("Gaming", "jeux vidéo gaming esport guide"),
-    ("Santé / Bien-être", "santé bien-être sport fitness nutrition"),
-    ("Cuisine / Recettes", "cuisine recette gastronomie repas restaurant"),
+    ("Dev / Tech", "software development code programming github engineering"),
+    ("Videos", "videos youtube streaming films shows"),
+    ("Social", "social media linkedin twitter facebook instagram"),
+    ("Shopping", "shopping online store ecommerce orders deals"),
+    ("News", "news press articles journal media headlines"),
+    ("Work", "work productivity documents email projects tasks"),
+    ("Learning", "courses learning tutorials education training"),
+    ("Travel", "travel flights hotels booking destinations"),
+    ("Finance", "banking finance investment stocks budget"),
+    ("Gaming", "video games gaming esports guides walkthroughs"),
+    ("Health", "health wellness sport fitness nutrition"),
+    ("Cooking", "cooking recipes food meals restaurants"),
 ];
 
 #[cfg(test)]

@@ -146,7 +146,7 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
         current_window: Some(true),
     })
     .await
-    .map_err(|e| format!("Erreur de lecture des onglets : {:?}", e))?;
+    .map_err(|e| format!("Error reading tabs: {:?}", e))?;
 
     // ── 4. Load stored state ─────────────────────────────────────────────
     let stored = crate::storage::load_state().await;
@@ -154,7 +154,7 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
     // ── 5. Build embedding texts ─────────────────────────────────────────
     // For each tab: concatenate title + domain (extracted from URL) rather than
     // the full URL. The domain adds a strong signal (e.g., "youtube.com" pulls
-    // tabs toward a "Vidéos" anchor) without relying on heuristic domain rules.
+    // tabs toward a "Videos" anchor) without relying on heuristic domain rules.
     // The grouping remains purely semantic.
     let tab_texts: Vec<(TabId, String)> = tabs
         .iter()
@@ -167,10 +167,10 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
         })
         .collect();
 
-    // Collect theme texts from stored groups with non-empty themes
-    // On embedde "NOM. THÈME" ensemble plutôt que le thème seul pour que le
-    // nom du groupe (signal court et fort) recentre l'ancre sémantique et
-    // évite la dilution du vecteur par des descriptions trop longues.
+    // Collect theme texts from stored groups with non-empty themes.
+    // Embed "NAME. THEME" together rather than the theme alone so the
+    // group name (a short, strong signal) re-centers the semantic anchor
+    // and prevents dilution by overly long descriptions.
     let mut theme_texts: Vec<(String, String)> = Vec::new();
     for group in &stored.groups {
         if !group.theme.trim().is_empty() {
@@ -181,6 +181,7 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
     // Build ordered list: all tab texts first, then all theme texts
     let mut all_texts: Vec<String> = tab_texts.iter().map(|(_, t)| t.clone()).collect();
     // Embed "NAME. THEME" as anchor text — the group name re-centers the vector
+    // and prevents dilution by overly long descriptions.
     let theme_text_only: Vec<String> = theme_texts
         .iter()
         .map(|(name, theme)| format!("{}. {}", name, theme))
@@ -191,16 +192,16 @@ pub async fn run_semantic_grouping() -> Result<(), String> {
 
     // ── 6. Embed all at once ─────────────────────────────────────────────
     let texts_json = serde_json::to_string(&all_texts)
-        .map_err(|e| format!("Echec de serialisation des textes : {}", e))?;
+        .map_err(|e| format!("Text serialization failed: {}", e))?;
 
     let flat_embeddings = embed_cached(&tokenizer_json, &texts_json)
-        .map_err(|e| format!("Echec de l'inference : {}", e))?;
+        .map_err(|e| format!("Inference failed: {}", e))?;
 
     // ── 7. Slice embeddings ──────────────────────────────────────────────
     let total_expected = flat_embeddings.len() / EMBEDDING_DIM;
     if total_expected < num_tabs + num_themes {
         return Err(format!(
-            "Nombre d'embeddings recu ({}) inferieur au nombre attendu ({} tabs + {} themes = {})",
+            "Received embeddings count ({}) lower than expected ({} tabs + {} themes = {})",
             total_expected,
             num_tabs,
             num_themes,

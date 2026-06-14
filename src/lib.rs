@@ -39,7 +39,7 @@ fn spawn_background_download(log_tag: &'static str) {
 async fn start() {
     oxichrome::log!("Tab Cleanner started!");
     ffi::messaging::register_message_listener();
-    // Heuristic run_grouping() retired; grouping is manual via the popup "Ranger" button.
+    // Heuristic run_grouping() retired; grouping is manual via the popup "Sort" button.
 
     // Safety net: download model in background if not already cached.
     // Idempotent — ensure_model_cached checks cache first.
@@ -58,6 +58,7 @@ async fn handle_install(details: oxichrome::__private::wasm_bindgen::JsValue) {
 #[oxichrome::popup]
 fn Popup() -> impl IntoView {
     let expanded: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
+    let editing_controls: RwSignal<Vec<String>> = RwSignal::new(Vec::new());
     let loading = RwSignal::new(true);
     let error_msg: RwSignal<Option<String>> = RwSignal::new(None);
     let data: RwSignal<Option<PopupData>> = RwSignal::new(None);
@@ -199,6 +200,14 @@ fn Popup() -> impl IntoView {
         crate::popup::handlers::handle_theme_change(group_name, theme_value, data)
     };
 
+    // ── Editing controls toggle ──
+    let toggle_edit_controls = move |name: String| {
+        crate::popup::handlers::handle_toggle_expand(name, editing_controls)
+    };
+    let is_editing_controls = move |name: &str| -> bool {
+        crate::popup::handlers::handle_is_expanded(name, editing_controls)
+    };
+
     // ── Render ──
     // Inject CSS into <head> on mount (avoids Leptos view! <style> text escaping)
     Effect::new(move |_| {
@@ -248,7 +257,7 @@ fn Popup() -> impl IntoView {
                         <div class="tc-sub">
                             {move || {
                                 data.get().as_ref().map(|d| {
-                                    format!("{} groupes . {} onglets", d.total_groups, d.total_tabs)
+                                    format!("{} groups \u{b7} {} tabs", d.total_groups, d.total_tabs)
                                 })
                                 .unwrap_or_else(|| "\u{2014}".to_string())
                             }}
@@ -261,14 +270,14 @@ fn Popup() -> impl IntoView {
                     class="tc-run"
                     disabled={move || !model_cached.get() || is_semantic_ranking.get()}
                     on:click=on_semantic
-                    title="Range les onglets dans les groupes existants par similarite thematique. Les onglets sans correspondance restent non ranges."
+                    title="Sort tabs into existing groups by thematic similarity. Tabs without a match stay unsorted."
                 >
                     {move || if is_semantic_ranking.get() {
-                        view! { <span class="tc-spin-icon">"\u{27F3}"</span> " Rangement\u{2026}" }.into_any()
+                        view! { <span class="tc-spin-icon">"\u{27F3}"</span> " Sorting\u{2026}" }.into_any()
                     } else if !model_cached.get() {
-                        view! { <span>"\u{1F9E0}"</span> " Ranger (modele requis)" }.into_any()
+                        view! { <span>"\u{27F3}"</span> " Sort (model required)" }.into_any()
                     } else {
-                        view! { <span>"\u{1F9E0}"</span> " Ranger" }.into_any()
+                        view! { <span>"\u{27F3}"</span> " Sort" }.into_any()
                     }}
                 </button>
 
@@ -276,7 +285,7 @@ fn Popup() -> impl IntoView {
                 {move || if !model_cached.get() {
                     view! {
                         <div class="tc-download-status">
-                            "Preparation du tri semantique\u{2026}"
+                            "Preparing semantic sorting\u{2026}"
                         </div>
                     }.into_any()
                 } else {
@@ -284,7 +293,7 @@ fn Popup() -> impl IntoView {
                 }}
 
                 <div class="tc-last-run">
-                    {move || if is_semantic_ranking.get() { "Rangement en cours\u{2026}" } else { "Rangement manuel via le bouton ci-dessus" }}
+                    {move || if is_semantic_ranking.get() { "Sorting\u{2026}" } else { "Manual sorting via the button above" }}
                 </div>
 
                 // ── New group creation ──
@@ -312,14 +321,14 @@ fn Popup() -> impl IntoView {
                                     on:input=on_name_input
                                     on:keydown=on_key1
                                     autofocus=true
-                                    placeholder="Nom du groupe..."
+                                    placeholder="Group name..."
                                 />
                                 <textarea
                                     class="tc-new-group-theme"
                                     prop:value={theme_val}
                                     on:input=on_theme_input
                                     on:keydown=on_key2
-                                    placeholder="Decris ce que ce groupe doit contenir — le tri rangera les onglets pertinents ici."
+                                    placeholder="Describe what this group should contain — sorting will place relevant tabs here."
                                     rows="2"
                                 ></textarea>
                                 <button
@@ -329,7 +338,7 @@ fn Popup() -> impl IntoView {
                                         on_create_click();
                                     }
                                 >
-                                    "Creer"
+                                    "Create"
                                 </button>
                             </div>
                         }
@@ -340,7 +349,7 @@ fn Popup() -> impl IntoView {
                                 class="tc-new-group-btn"
                                 on:click=move |_| show_new_group_input.set(true)
                             >
-                                "+ Nouveau groupe"
+                                "+ New group"
                             </button>
                         }
                         .into_any()
@@ -355,14 +364,14 @@ fn Popup() -> impl IntoView {
                         view! {
                             <div class="tc-state">
                                 <div class="tc-spinner"></div>
-                                <p>"Chargement des groupes\u{2026}"</p>
+                                <p>"Loading groups\u{2026}"</p>
                             </div>
                         }.into_any()
                     } else if let Some(ref err) = error_msg.get() {
                         let msg = err.clone();
                         view! {
                             <div class="tc-state tc-error">
-                                <p>"Impossible de charger les donnees."</p>
+                                <p>"Failed to load data."</p>
                                 <p class="tc-error-detail">{msg}</p>
                             </div>
                         }.into_any()
@@ -373,13 +382,13 @@ fn Popup() -> impl IntoView {
                         if all_empty {
                             view! {
                                 <div class="tc-state tc-empty-guided">
-                                    <p>"Cree un groupe avec un theme pour commencer."</p>
-                                    <p>"Le tri rangera automatiquement tes onglets correspondants."</p>
+                                    <p>"Create a group with a theme to get started."</p>
+                                    <p>"Sorting will automatically place your matching tabs."</p>
                                     <button
                                         class="tc-create-btn tc-create-guide"
                                         on:click=move |_| show_new_group_input.set(true)
                                     >
-                                        "+ Creer mon premier groupe"
+                                        "+ Create my first group"
                                     </button>
                                 </div>
                             }.into_any()
@@ -388,6 +397,8 @@ fn Popup() -> impl IntoView {
                                 data,
                                 toggle_expand.clone(),
                                 is_expanded.clone(),
+                                toggle_edit_controls.clone(),
+                                is_editing_controls.clone(),
                                 editing_name,
                                 draft_name,
                                 start_rename.clone(),
@@ -411,4 +422,4 @@ fn Popup() -> impl IntoView {
 
 // ── run_grouping() removed — heuristic grouping retired. ──
 // Grouping is now performed exclusively via run_semantic_grouping()
-// in src/semantic.rs, triggered by the "Ranger" button in the popup.
+// in src/semantic.rs, triggered by the "Sort" button in the popup.

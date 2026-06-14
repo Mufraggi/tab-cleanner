@@ -92,7 +92,7 @@ async fn handle_update_group(
             .groups
             .iter_mut()
             .find(|g| g.name == name)
-            .ok_or_else(|| format!("Groupe '{}' introuvable", name))?;
+            .ok_or_else(|| format!("Group '{}' not found", name))?;
 
         // 3. Apply field updates
         if let Some(dn) = display_name {
@@ -121,7 +121,7 @@ async fn handle_update_group(
             };
             crate::ffi::tab_groups::update_tab_group(gid, &props)
                 .await
-                .map_err(|e| format!("Echec de mise a jour Chrome : {:?}", e))?;
+                .map_err(|e| format!("Chrome update failed: {:?}", e))?;
         }
     }
 
@@ -179,7 +179,7 @@ async fn handle_dissolve_group(name: String) -> Result<(), String> {
             .groups
             .iter()
             .find(|g| g.name == name)
-            .ok_or_else(|| format!("Groupe '{}' introuvable", name))?;
+            .ok_or_else(|| format!("Group '{}' not found", name))?;
         chrome_group_id = group.group_id;
     }
 
@@ -189,13 +189,13 @@ async fn handle_dissolve_group(name: String) -> Result<(), String> {
             &crate::types::QueryByGroupId { group_id: gid },
         )
         .await
-        .map_err(|e| format!("Erreur de lecture des onglets : {:?}", e))?;
+        .map_err(|e| format!("Error reading tabs: {:?}", e))?;
 
         let tab_ids: Vec<i32> = tabs.iter().map(|t| t.id).collect();
         if !tab_ids.is_empty() {
             crate::ffi::tabs_ext::ungroup_tabs(&tab_ids)
                 .await
-                .map_err(|e| format!("Erreur de dissociation des onglets : {:?}", e))?;
+                .map_err(|e| format!("Tab ungrouping failed: {:?}", e))?;
         }
     }
 
@@ -213,9 +213,9 @@ async fn handle_dissolve_group(name: String) -> Result<(), String> {
 /// Returns `Ok("downloaded")` when both files are cached (either from cache or network).
 async fn handle_download_model() -> Result<String, String> {
     let src1 = crate::sml::ensure_model_cached(crate::types::MODEL_URL).await
-        .map_err(|e| format!("Echec du telechargement du modele : {}", e))?;
+        .map_err(|e| format!("Model download failed: {}", e))?;
     let src2 = crate::sml::ensure_model_cached(crate::types::TOKENIZER_URL).await
-        .map_err(|e| format!("Echec du telechargement du tokenizer : {}", e))?;
+        .map_err(|e| format!("Tokenizer download failed: {}", e))?;
     oxichrome::log!(
         "[messaging] Model cache: {} (model), {} (tokenizer)",
         src1,

@@ -37,7 +37,7 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
     //    Chrome storage.local is accessible to popup context without waking the SW.
     let state: GroupState = storage::get::<GroupState>(GROUP_STATE_KEY)
         .await
-        .map_err(|e| format!("Erreur de lecture du storage : {:?}", e))?
+        .map_err(|e| format!("Error reading storage: {:?}", e))?
         .unwrap_or_else(|| GroupState {
             version: 1,
             groups: vec![],
@@ -48,7 +48,7 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
         current_window: Some(true),
     })
     .await
-    .map_err(|e| format!("Impossible de lire les onglets : {:?}", e))?;
+    .map_err(|e| format!("Failed to read tabs: {:?}", e))?;
 
     // 3. Build group_id -> StoredGroup map
     let id_to_group: std::collections::HashMap<i32, &crate::types::StoredGroup> = state
@@ -115,13 +115,13 @@ pub async fn fetch_popup_data() -> Result<PopupData, String> {
 pub async fn check_model_cached() -> Result<bool, String> {
     let resp_js = send_message_with_retry(&crate::ffi::messaging::PopupCommand::CheckModelCached)
         .await
-        .map_err(|e| format!("Echec d'envoi : {:?}", e))?;
+        .map_err(|e| format!("Send failed: {:?}", e))?;
 
     let resp: MessagingResponse = serde_wasm_bindgen::from_value(resp_js)
-        .map_err(|e| format!("Reponse invalide : {:?}", e))?;
+        .map_err(|e| format!("Invalid response: {:?}", e))?;
 
     if !resp.success {
-        let msg = resp.data.unwrap_or_else(|| "Echec de la verification".to_string());
+        let msg = resp.data.unwrap_or_else(|| "Verification failed".to_string());
         return Err(msg);
     }
 

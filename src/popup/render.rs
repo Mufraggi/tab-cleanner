@@ -9,6 +9,8 @@ pub fn render_content(
     data: RwSignal<Option<PopupData>>,
     toggle: impl Fn(String) + 'static + Clone + Send,
     is_expanded: impl Fn(&str) -> bool + 'static + Clone + Send,
+    toggle_edit: impl Fn(String) + 'static + Clone + Send,
+    is_editing_controls: impl Fn(&str) -> bool + 'static + Clone + Send,
     editing_name: RwSignal<Option<String>>,
     draft_name: RwSignal<String>,
     on_start_rename: impl Fn(String, String) + 'static + Clone + Send,
@@ -80,6 +82,15 @@ pub fn render_content(
                 let gn_dissolve = name.clone();
                 let has_group_id = g.group_id.is_some();
 
+                // Edit controls toggle clones
+                let toggle_edit_c2 = toggle_edit.clone();
+                let nt_edit2 = name.clone();
+                let on_toggle_edit2 = move |_| toggle_edit_c2(nt_edit2.clone());
+                let is_edit_ctrl = is_editing_controls.clone();
+                let ne_ctrl = name.clone();
+                let is_edit_ctrl2 = is_editing_controls.clone();
+                let ne_ctrl2 = name.clone();
+
 
                 view! {
                     <section
@@ -91,7 +102,7 @@ pub fn render_content(
                             <button
                                 class="tc-chev"
                                 on:click=on_toggle
-                                aria-label={move || if is_exp_chev1(&ne_chev1) { "Replier" } else { "Deplier" }}
+                                aria-label={move || if is_exp_chev1(&ne_chev1) { "Collapse" } else { "Expand" }}
                             >
                                 {move || if is_exp_chev2(&ne_chev2) { "\u{25BC}" } else { "\u{25B6}" }}
                             </button>
@@ -149,7 +160,7 @@ pub fn render_content(
                                         <button
                                             class="tc-name-btn"
                                             on:click=move |_| on_start(gn.clone(), gd.clone())
-                                            title="Renommer"
+                                            title="Rename"
                                         >
                                             <span class="tc-name">{gd.clone()}</span>
                                             <span class="tc-pencil">"\u{270F}"</span>
@@ -166,43 +177,13 @@ pub fn render_content(
                         // ── Expanded body: reactive conditional ──
                         {move || {
                             if is_exp_body(&ne_body) {
-                                let palette_buttons: Vec<_> = PALETTE
-                                    .iter()
-                                    .map(|c| {
-                                        let hex = lookup_hex(c).to_string();
-                                        let active = *c == color_name_body;
-                                        let style_val = if active {
-                                            format!(
-                                                "background:{};border-color:#fff;transform:scale(1.05)",
-                                                hex
-                                            )
-                                        } else {
-                                            format!("background:{}", hex)
-                                        };
-                                        let check = if active { "\u{2713}" } else { "" };
-                                        let oc_btn = oc.clone();
-                                        let gn_btn = gn_color.clone();
-                                        let c_btn = c.to_string();
-                                        view! {
-                                            <button
-                                                class="tc-swatch"
-                                                title=format!("couleur {}", c)
-                                                style=style_val
-                                                on:click=move |_| oc_btn(gn_btn.clone(), c_btn.clone())
-                                            >
-                                                {check}
-                                            </button>
-                                        }
-                                    })
-                                    .collect();
-
                                 let tab_items: Vec<_> = tabs_data_body
                                     .iter()
                                     .map(|tab| {
                                         let title = tab
                                             .title
                                             .as_deref()
-                                            .unwrap_or("(sans titre)")
+                                            .unwrap_or("(untitled)")
                                             .to_string();
                                         let url = tab
                                             .url
@@ -223,59 +204,115 @@ pub fn render_content(
                                     })
                                     .collect();
 
-                                // Clone ot inside so the on:blur closure doesn't consume the outer copy
-                                let ot_inner = ot.clone();
-                                let gn_theme_inner = gn_theme.clone();
-
+                                // Compute palette buttons and edit panel content inside this
+                                // reactive block so ot_inner/gn_theme_inner are local and
+                                // don't cause FnOnce issues in nested closures.
+                                let palette_buttons: Vec<_> = PALETTE
+                                    .iter()
+                                    .map(|c| {
+                                        let hex = lookup_hex(c).to_string();
+                                        let active = *c == color_name_body;
+                                        let style_val = if active {
+                                            format!(
+                                                "background:{};border-color:#fff;transform:scale(1.05)",
+                                                hex
+                                            )
+                                        } else {
+                                            format!("background:{}", hex)
+                                        };
+                                        let check = if active { "\u{2713}" } else { "" };
+                                        let oc_btn = oc.clone();
+                                        let gn_btn = gn_color.clone();
+                                        let c_btn = c.to_string();
+                                        view! {
+                                            <button
+                                                class="tc-swatch"
+                                                title=format!("color {}", c)
+                                                style=style_val
+                                                on:click=move |_| oc_btn(gn_btn.clone(), c_btn.clone())
+                                            >
+                                                {check}
+                                            </button>
+                                        }
+                                    })
+                                    .collect();
+                                let on_toggle_edit2_local = on_toggle_edit2.clone();
+                                let is_edit_ctrl2_local = is_edit_ctrl2.clone();
+                                let ne_ctrl2_local = ne_ctrl2.clone();
+                                let is_edit_ctrl_local = is_edit_ctrl.clone();
+                                let ne_ctrl_local = ne_ctrl.clone();
+                                let ot_local = ot.clone();
+                                let gn_theme_local = gn_theme.clone();
+                                let palette_buttons_local = palette_buttons.clone();
+                                let theme_body_local = theme_body.clone();
+                                let od_local = od.clone();
+                                let gn_dissolve_local = gn_dissolve.clone();
                                 view! {
                                     <div class="tc-group-body">
-                                        <div class="tc-row">
-                                            <span class="tc-row-label">"Couleur"</span>
-                                            <div class="tc-palette">{palette_buttons}</div>
-                                        </div>
-                                        <div class="tc-row">
-                                            <span class="tc-row-label">
-                                                "Theme"
-                                                <span class="tc-soon">"bientot"</span>
-                                            </span>
-                                            <input
-                                                class="tc-theme-input"
-                                                placeholder="Decris ce groupe pour le tri auto..."
-                                                prop:value={theme_body.clone()}
-                                                on:input=|_| {}
-                                                on:blur=move |ev| {
-                                                    if let Some(target) = ev.target() {
-                                                        if let Ok(val) = js_sys::Reflect::get(
-                                                            &target,
-                                                            &wasm_bindgen::JsValue::from_str("value"),
-                                                        ) {
-                                                            if let Some(s) = val.as_string() {
-                                                                let trimmed = s.trim().to_string();
-                                                                if !trimmed.is_empty() {
-                                                                    ot_inner(gn_theme_inner.clone(), trimmed);
+                                        <ul class="tc-tab-list">{tab_items}</ul>
+                                        <button
+                                            class="tc-edit-toggle"
+                                            on:click=on_toggle_edit2_local
+                                        >
+                                            {move || if is_edit_ctrl2_local(&ne_ctrl2_local) {
+                                                "\u{2715} Editing"
+                                            } else {
+                                                "\u{270E} Edit"
+                                            }}
+                                        </button>
+                                {move || if is_edit_ctrl_local(&ne_ctrl_local) {
+                                            let ot_inner = ot_local.clone();
+                                            let gn_theme_inner = gn_theme_local.clone();
+                                            view! {
+                                                <div class="tc-edit-panel">
+                                                    <div class="tc-row">
+                                                        <span class="tc-row-label">"Color"</span>
+                                                        <div class="tc-palette">{palette_buttons_local.clone()}</div>
+                                                    </div>
+                                                    <div class="tc-row">
+                                                        <span class="tc-row-label">"Theme"</span>
+                                                        <input
+                                                            class="tc-theme-input"
+                                                            placeholder="Describe this group for automatic sorting..."
+                                                            prop:value={theme_body_local.clone()}
+                                                            on:input=|_| {}
+                                                            on:blur=move |ev| {
+                                                                if let Some(target) = ev.target() {
+                                                                    if let Ok(val) = js_sys::Reflect::get(
+                                                                        &target,
+                                                                        &wasm_bindgen::JsValue::from_str("value"),
+                                                                    ) {
+                                                                        if let Some(s) = val.as_string() {
+                                                                            let trimmed = s.trim().to_string();
+                                                                            if !trimmed.is_empty() {
+                                                                                ot_inner(gn_theme_inner.clone(), trimmed);
+                                                                            }
+                                                                        }
+                                                                    }
                                                                 }
                                                             }
+                                                        />
+                                                    </div>
+                                                    <p class="tc-theme-hint">
+                                                        "Used for automatic sorting: describe in a few words what this group contains."
+                                                    </p>
+                                                    {if has_group_id {
+                                                        let od_btn = od_local.clone();
+                                                        let gn_d_btn = gn_dissolve_local.clone();
+                                                        view! {
+                                                            <button
+                                                                class="tc-dissolve-btn"
+                                                                on:click=move |_| od_btn(gn_d_btn.clone())
+                                                            >
+                                                                "Dissolve"
+                                                            </button>
                                                         }
-                                                    }
-                                                }
-                                            />
-                                        </div>
-                                        <p class="tc-theme-hint">
-                                            "Servira au tri automatique : explique en quelques mots ce que contient ce groupe."
-                                        </p>
-                                        <ul class="tc-tab-list">{tab_items}</ul>
-                                        {if has_group_id {
-                                            let od_btn = od.clone();
-                                            let gn_d_btn = gn_dissolve.clone();
-                                            view! {
-                                                <button
-                                                    class="tc-dissolve-btn"
-                                                    on:click=move |_| od_btn(gn_d_btn.clone())
-                                                >
-                                                    "Dissoudre"
-                                                </button>
-                                            }
-                                            .into_any()
+                                                        .into_any()
+                                                    } else {
+                                                        view! {}.into_any()
+                                                    }}
+                                                </div>
+                                            }.into_any()
                                         } else {
                                             view! {}.into_any()
                                         }}
@@ -304,7 +341,7 @@ pub fn render_content(
                         let title = tab
                             .title
                             .as_deref()
-                            .unwrap_or("(sans titre)")
+                            .unwrap_or("(untitled)")
                             .to_string();
                         let url = tab
                             .url
@@ -324,7 +361,7 @@ pub fn render_content(
                     <section class="tc-other">
                         <div class="tc-other-head">
                             <span class="tc-other-icon">"\u{1F4E5}"</span>
-                            <span class="tc-other-title">"Non ranges"</span>
+                            <span class="tc-other-title">"Unsorted"</span>
                             <span class="tc-count">{ungrouped.len()}</span>
                         </div>
                         <ul class="tc-tab-list">{ungrouped_items}</ul>
@@ -339,20 +376,20 @@ pub fn render_content(
 
 pub fn render_onboarding(
     onboarding_selected: RwSignal<Vec<usize>>,
-    on_commencer: impl Fn() + 'static + Clone,
-    on_passer: impl Fn() + 'static + Clone,
+    on_get_started: impl Fn() + 'static + Clone,
+    on_skip: impl Fn() + 'static + Clone,
 ) -> impl IntoView {
     use crate::types::ONBOARDING_THEMES;
 
-    let can_commencer = move || !onboarding_selected.with(|v| v.is_empty());
+    let can_start = move || !onboarding_selected.with(|v| v.is_empty());
 
     view! {
         <div class="tc-onboarding">
             <div class="tc-onboarding-title">
-                "Bienvenue ! Choisis les themes qui t'interessent"
+                "Welcome! Choose the themes that interest you"
             </div>
             <div class="tc-onboarding-sub">
-                "Selectionne les themes que tu souhaites suivre. Des groupes seront crees automatiquement."
+                "Select the themes you want to track. Groups will be created automatically."
             </div>
             <div class="tc-onboarding-grid">
                 {
@@ -394,17 +431,17 @@ pub fn render_onboarding(
                 }
             </div>
             <button
-                class="tc-onboarding-commencer"
-                disabled=move || !can_commencer()
-                on:click=move |_| on_commencer()
+                class="tc-onboarding-cta"
+                disabled=move || !can_start()
+                on:click=move |_| on_get_started()
             >
-                "Commencer"
+                "Get started"
             </button>
             <button
-                class="tc-onboarding-passer"
-                on:click=move |_| on_passer()
+                class="tc-onboarding-skip"
+                on:click=move |_| on_skip()
             >
-                "Passer"
+                "Skip"
             </button>
         </div>
     }
